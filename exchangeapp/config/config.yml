@@ -1,0 +1,8 @@
+app:
+  name: CurrencyExchangeApp 
+  port: :3000
+database:
+  Dsn: "root:126070mxZ@tcp(127.0.0.1:3306)/text?charset=utf8mb4&parseTime=True&loc=Local"
+  MaxIdleConns: 11
+  MaxOpenConns: 114
+  
