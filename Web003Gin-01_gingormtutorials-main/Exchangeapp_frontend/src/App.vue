@@ -5,6 +5,7 @@
         <el-menu-item index="home">首页</el-menu-item>
         <el-menu-item index="currencyExchange">兑换货币</el-menu-item>
         <el-menu-item index="news">查看新闻</el-menu-item>
+        <el-menu-item index="createArticle" v-if="authStore.isAuthenticated">发布文章</el-menu-item>
         <el-menu-item index="login" v-if="!authStore.isAuthenticated">登录</el-menu-item>
         <el-menu-item index="register" v-if="!authStore.isAuthenticated">注册</el-menu-item>
         <el-menu-item index="logout" v-if="authStore.isAuthenticated">退出</el-menu-item>
