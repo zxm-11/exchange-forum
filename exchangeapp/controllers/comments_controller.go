@@ -1,14 +1,18 @@
 package controllers
 
 import (
+	"encoding/json"
 	"exchangeapp/global"
 	"exchangeapp/models"
 	"net/http"
 	"strconv"
+	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/go-redis/redis/v8"
 )
 
+// CreateComment函数用于创建评论
 func CreateComment(ctx *gin.Context) {
 
 	var comment models.Comment
@@ -37,7 +41,87 @@ func CreateComment(ctx *gin.Context) {
 		})
 		return
 	}
-	cachekey :="article:"+ctx.Param("id")+":comments" //定义一个缓存key,用于存储文章详情的缓存key
-	global.RedisDB.Del(ctx,cachekey) //删除文章详情的缓存,让下一次访问文章详情时重新查询数据库并更新缓存
+	cachekey := "article:" + ctx.Param("id") + ":comments" //定义一个缓存key,用于存储文章详情的缓存key
+	global.RedisDB.Del(ctx, cachekey)                      //删除文章详情的缓存,让下一次访问文章详情时重新查询数据库并更新缓存
 	ctx.JSON(http.StatusOK, comment)
+}
+
+// GetCommentsByArticleID函数用于获取文章下的评论列表
+func GetCommentsByArticleID(ctx *gin.Context) {
+	cachekey := "article:" + ctx.Param("id") + ":comments"
+
+	cachedata, err := global.RedisDB.Get(ctx, cachekey).Result()
+	if err == redis.Nil {
+		var comments []models.Comment
+		if err := global.Db.Where("article_id=?", ctx.Param("id")).Order("created_at DESC").Find(&comments).Error; err != nil {
+			ctx.JSON(http.StatusInternalServerError, gin.H{
+				"error": err.Error(),
+			})
+			return
+		}
+		cacheJSON, err := json.Marshal(comments) //将评论列表转换为JSON格式的字节切片
+		if err != nil {
+			ctx.JSON(http.StatusInternalServerError, gin.H{
+				"error": err.Error(),
+			})
+			return
+		}
+
+		if err := global.RedisDB.Set(ctx, cachekey, cacheJSON, time.Minute*10).Err(); err != nil {
+			ctx.JSON(http.StatusInternalServerError, gin.H{
+				"error": err.Error(),
+			})
+			return
+		}
+		ctx.JSON(http.StatusOK, comments)
+
+	} else if err != nil {
+		ctx.JSON(http.StatusInternalServerError, gin.H{
+			"error": err.Error(),
+		})
+		return
+	} else {
+		var comments []models.Comment
+		if err := json.Unmarshal([]byte(cachedata), &comments); err != nil {
+			ctx.JSON(http.StatusInternalServerError, gin.H{
+				"error": err.Error(),
+			})
+			return
+		}
+		ctx.JSON(http.StatusOK, comments) //如果缓存中有数据,直接返回缓存中的数据
+	}
+}
+
+// DeleteComment函数用于删除评论
+func DeleteComment(ctx *gin.Context) {
+	comment_id := ctx.Param("comment_id")
+	var comment models.Comment
+	if err := global.Db.Where("id=?", comment_id).First(&comment).Error; err != nil {
+		ctx.JSON(http.StatusNotFound, gin.H{
+			"error": err.Error(),
+		})
+		return
+	}
+	if comment.Username == ctx.GetString("username") { //检查评论的用户名是否与当前用户的用户名匹配,如果不匹配,返回403 Forbidden错误}
+		if err := global.Db.Delete(&comment).Error; err != nil {
+			ctx.JSON(http.StatusInternalServerError, gin.H{
+				"error": err.Error(),
+			})
+			return
+		}
+		cachekey := "article:" + strconv.FormatUint(uint64(comment.ArticleID), 10) + ":comments"
+		if err := global.RedisDB.Del(ctx, cachekey).Err(); err != nil {
+			ctx.JSON(http.StatusInternalServerError, gin.H{
+				"error": err.Error(),
+			})
+			return
+		}
+		ctx.JSON(http.StatusOK, gin.H{
+			"message": "comment deleted successfully",
+		})
+	} else {
+		ctx.JSON(
+			http.StatusForbidden, gin.H{"error": "you are not authorized to delete this comment"})
+		return
+	}
 }
