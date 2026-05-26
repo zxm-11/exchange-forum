@@ -1,0 +1,251 @@
+================================================================================
+                    文章评论功能 — 完整实现大纲
+================================================================================
+
+一、Git 分支管理
+================================================================================
+
+  1. 创建并切换到功能分支（所有改动都在这个分支上，master保持干净）
+     git checkout -b feature-comments
+
+  2. 随时查看当前分支和文件状态
+     git status
+     git branch
+
+  3. 代码改到阶段性节点时，提交一次
+     git add .                           # 暂存所有修改
+     git commit -m "描述你做了什么"        # 提交到本地
+
+  4. 如果改坏了、想放弃所有未提交的改动，回到上次提交的干净状态
+     git checkout -- <文件名>               # 只恢复某个文件
+     git restore .                         # 恢复所有文件
+
+  5. 如果想放弃整个分支、回到 master 重新来
+     git checkout master
+     git branch -D feature-comments
+
+  6. 完成后，切回 master 并合并分支
+     git checkout master
+     git merge feature-comments
+
+  7. 合并完删除分支（可选）
+     git branch -d feature-comments
+
+  8. 查看提交历史
+     git log --oneline
+
+
+二、后端实现 (Go + Gin + GORM)
+================================================================================
+
+【文件1】新建 exchangeapp/models/comment.go
+--------------------------------------------------------------------------------
+  - 定义 Comment 结构体
+  - 嵌入 gorm.Model（自动获得 ID、CreatedAt、UpdatedAt、DeletedAt）
+  - 字段：
+      ArticleID  uint    `json:"article_id" binding:"required"`
+      Username   string  `json:"username"   binding:"required"`
+      Content    string  `json:"content"    binding:"required"`
+
+  - 注意：CreatedAt 在 gorm.Model 里已有，前端显示时间用它即可
+
+
+【文件2】新建 exchangeapp/controllers/comment_controller.go
+--------------------------------------------------------------------------------
+  三个函数：
+
+  2.1 CreateComment
+       - 从 URL 参数 ctx.Param("id") 获取文章ID
+       - ctx.ShouldBindJSON 绑定请求体到 Comment 结构体
+       - 手动设置 comment.ArticleID = 文章ID
+       - 从 ctx.GetString("username") 获取当前登录用户名（中间件注入的）
+       - 设置 comment.Username = username
+       - global.Db.AutoMigrate(&models.Comment{}) 自动建表
+       - global.Db.Create(&comment) 写入数据库
+       - global.RedisDB.Del(ctx, "article:<id>:comments") 刷新缓存
+       - 返回创建的评论
+
+  2.2 GetCommentsByArticleID
+       - 从 ctx.Param("id") 获取文章ID
+       - 用 Redis 缓存，key = "article:<id>:comments"
+       - 先查缓存，命中则反序列化返回
+       - 未命中则查数据库：
+           var comments []models.Comment
+           global.Db.Where("article_id = ?", id).Order("created_at DESC").Find(&comments)
+       - 序列化后写入 Redis，过期时间 10 分钟
+       - 返回评论列表
+
+  2.3 DeleteComment
+       - 从 ctx.Param("id") 获取评论ID
+       - 查数据库找到该评论
+       - 比对 comment.Username == ctx.GetString("username")（只能删自己的）
+       - 不匹配返回 403
+       - 匹配则 global.Db.Delete(&comment)
+       - 刷新对应文章的评论缓存
+       - 返回成功消息
+
+
+【文件3】修改 exchangeapp/router/router.go
+--------------------------------------------------------------------------------
+  在受保护的 api 路由组内（api.Use(middlewares.AuthMiddleware()) 的括号内）添加：
+
+      api.POST("/articles/:id/comments", controllers.CreateComment)
+      api.GET("/articles/:id/comments", controllers.GetCommentsByArticleID)
+      api.DELETE("/comments/:id", controllers.DeleteComment)
+
+  注意：DELETE 路由没有文章 ID 前缀，所以 URI 参数名要和 controller 里对应
+
+
+【文件4】修改 exchangeapp/controllers/auth_controller.go
+--------------------------------------------------------------------------------
+  Login 和 Register 返回的 JSON 中增加 username 字段，供前端存储：
+
+      ctx.JSON(http.StatusOK, gin.H{
+          "token":    token,
+          "username": user.Username,
+      })
+
+
+三、路由和控制器对应关系总结
+================================================================================
+
+  方法     路径                            控制器函数               认证
+  ─────────────────────────────────────────────────────────────────────
+  POST    /api/articles/:id/comments      CreateComment            需要
+  GET     /api/articles/:id/comments      GetCommentsByArticleID   需要
+  DELETE  /api/comments/:id               DeleteComment            需要
+
+
+四、API 请求/响应示例
+================================================================================
+
+  POST /api/articles/1/comments
+  Header: Authorization: Bearer <token>
+  Body:   { "content": "这篇文章写得很好！" }
+  Response: {
+      "ID": 1,
+      "ArticleID": 1,
+      "Username": "zhangsan",
+      "Content": "这篇文章写得很好！",
+      "CreatedAt": "2026-05-26T10:30:00Z"
+  }
+
+  GET /api/articles/1/comments
+  Header: Authorization: Bearer <token>
+  Response: [
+      {
+          "ID": 1,
+          "ArticleID": 1,
+          "Username": "zhangsan",
+          "Content": "这篇文章写得很好！",
+          "CreatedAt": "2026-05-26T10:30:00Z"
+      },
+      { ... }
+  ]
+
+  DELETE /api/comments/1
+  Header: Authorization: Bearer <token>
+  Response: { "message": "Comment deleted successfully" }
+
+
+五、前端实现 (Vue 3 + TypeScript)
+================================================================================
+
+【文件5】修改 src/types/Article.d.ts
+--------------------------------------------------------------------------------
+  新增 Comment 接口：
+      export interface Comment {
+          ID: number;
+          ArticleID: number;
+          Username: string;
+          Content: string;
+          CreatedAt: string;
+      }
+
+
+【文件6】修改 src/store/auth.ts
+--------------------------------------------------------------------------------
+  - 新增 username ref：
+      const username = ref<string | null>(localStorage.getItem('username'));
+
+  - login/register 成功后存储：
+      username.value = response.data.username;
+      localStorage.setItem('username', username.value || '');
+
+  - logout 时清除：
+      username.value = null;
+      localStorage.removeItem('username');
+
+  - 在 return 中导出 username
+
+
+【文件7】修改 src/views/NewsDetailView.vue
+--------------------------------------------------------------------------------
+  模板部分新增（在文章卡片 </el-card> 之后）：
+
+      <!-- 评论输入区（仅登录用户可见） -->
+      <el-card v-if="authStore.isAuthenticated" class="comment-form">
+          <el-input
+              v-model="newComment"
+              type="textarea"
+              placeholder="写下你的评论..."
+              rows="3"
+          />
+          <el-button type="primary" @click="submitComment" style="margin-top:10px">
+              发表评论
+          </el-button>
+      </el-card>
+
+      <!-- 评论列表 -->
+      <el-card v-if="comments.length > 0" class="comment-list">
+          <h3>评论 ({{ comments.length }})</h3>
+          <div v-for="comment in comments" :key="comment.ID" class="comment-item">
+              <div class="comment-header">
+                  <strong>{{ comment.Username }}</strong>
+                  <span>{{ new Date(comment.CreatedAt).toLocaleString() }}</span>
+              </div>
+              <p>{{ comment.Content }}</p>
+              <el-button
+                  v-if="comment.Username === authStore.username"
+                  type="danger"
+                  size="small"
+                  @click="deleteComment(comment.ID)"
+              >
+                  删除
+              </el-button>
+          </div>
+      </el-card>
+
+  script 部分新增：
+      import { useAuthStore } from '../store/auth';
+      import type { Comment } from '../types/Article';
+
+      const authStore = useAuthStore();
+      const comments = ref<Comment[]>([]);
+      const newComment = ref('');
+
+      const fetchComments = async () => { ... }
+      const submitComment = async () => { ... }
+      const deleteComment = async (commentId: number) => { ... }
+
+      onMounted(fetchComments);  // 页面加载时获取评论
+
+
+六、推荐开发顺序
+================================================================================
+
+  1. git checkout -b feature-comments        ← 先建分支
+  2. 写后端 Comment 模型
+  3. 写后端评论控制器
+  4. 修改 router.go 添加路由
+  5. 修改 auth_controller.go 返回 username
+  6. 后端自测：用 curl 或 Postman 测试三个接口
+  7. 前端改类型、store、视图
+  8. 联调：启动前后端，完整走一遍流程
+  9. git add . && git commit -m "添加文章评论功能"
+  10. git checkout master && git merge feature-comments
+
+
+================================================================================
+                              祝你实现顺利！
+================================================================================
