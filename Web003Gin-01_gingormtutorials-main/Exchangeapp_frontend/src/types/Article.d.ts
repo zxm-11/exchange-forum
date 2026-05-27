@@ -11,8 +11,8 @@ export interface Like{
 
 export interface Comment {
     ID: number;
-    ArticleID: number;
-    Username: string;
-    Content: string;
     CreatedAt: string;
+    article_id: number;
+    username: string;
+    content: string;
 }

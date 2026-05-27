@@ -30,12 +30,12 @@
         <h3>评论 ({{ comments.length }})</h3>
         <div v-for="item in comments" :key="item.ID" class="comment-item">
           <div class="comment-header">
-            <strong>{{ item.Username }}</strong>
+            <strong>{{ item.username }}</strong>
             <span class="comment-time">{{ new Date(item.CreatedAt).toLocaleString() }}</span>
           </div>
-          <p class="comment-content">{{ item.Content }}</p>
+          <p class="comment-content">{{ item.content }}</p>
           <el-button
-            v-if="item.Username === authStore.username"
+            v-if="item.username === authStore.username"
             type="danger"
             size="small"
             @click="deleteComment(item.ID)"
