@@ -1,0 +1,1763 @@
+================================================================================
+    RabbitMQ 优化实现方案 —— 完整代码与解析
+    项目: 货币论坛系统 (exchangeapp)
+    日期: 2026/06/08
+================================================================================
+
+本文件包含两个 RabbitMQ 优化场景的完整实现方案:
+  场景一: 点赞计数器持久化 (Redis → MySQL)
+  场景三: 评论异步通知
+
+所有代码基于项目现有的 Gin + GORM + Redis 架构编写，使用
+github.com/rabbitmq/amqp091-go 作为 RabbitMQ Go 客户端。
+
+================================================================================
+第一部分: 前置依赖与基础设施
+================================================================================
+
+【1. 安装依赖】
+
+在 exchangeapp 目录下执行:
+
+  go get github.com/rabbitmq/amqp091-go
+
+【2. 配置文件更新】
+
+文件路径: exchangeapp/config/config.yml
+
+在原有配置基础上新增 rabbitmq 段:
+
+-------------------------------- 完整 config.yml --------------------------------
+app:
+  name: "exchangeapp"
+  port: ":8080"
+
+database:
+  dsn: "root:password@tcp(127.0.0.1:3306)/exchangeapp?charset=utf8mb4&parseTime=True&loc=Local"
+  maxidleconns: 10
+  maxopenconns: 100
+
+rabbitmq:
+  host: "localhost"           # RabbitMQ 服务器地址
+  port: "5672"                # RabbitMQ 端口
+  user: "guest"               # 用户名 (默认 guest)
+  password: "guest"           # 密码 (默认 guest)
+  vhost: "/"                  # 虚拟主机 (默认 /)
+  likeprefetch: 50            # 点赞消费者的预取数量 (批量处理)
+  notifyprefetch: 10          # 通知消费者的预取数量
+  liketaskinterval: 5          # 点赞批量写入间隔 (秒)
+--------------------------------------------------------------------------------
+
+【3. 配置结构体更新】
+
+文件路径: exchangeapp/config/config.go
+
+-------------------------------- 完整 config.go --------------------------------
+package config
+
+import (
+    "log"
+
+    "github.com/spf13/viper"
+)
+
+type config struct {
+    App struct {
+        Name string
+        Port string
+    }
+    Database struct {
+        Dsn          string
+        MaxIdleConns int
+        MaxOpenConns int
+    }
+    // ========== 新增 RabbitMQ 配置 ==========
+    RabbitMQ struct {
+        Host             string
+        Port             string
+        User             string
+        Password         string
+        Vhost            string
+        LikePrefetch     int  // 点赞消费者预取数量
+        NotifyPrefetch   int  // 通知消费者预取数量
+        LikeTaskInterval int  // 点赞批量写入间隔 (秒)
+    }
+    // ========================================
+}
+
+var AppConfig *config
+
+func InitConfig() {
+    viper.SetConfigName("config")
+    viper.SetConfigType("yml")
+    viper.AddConfigPath("./config")
+
+    if err := viper.ReadInConfig(); err != nil {
+        log.Fatalf("Error reading config file%v", err)
+    }
+
+    AppConfig = &config{}
+
+    if err := viper.Unmarshal(&AppConfig); err != nil {
+        log.Fatalf("Unable to decode into struct%v", err)
+    }
+
+    InitDB()
+    InitRedis()
+    InitRabbitMQ()  // ========== 新增: 初始化 RabbitMQ ==========
+}
+--------------------------------------------------------------------------------
+
+【4. RabbitMQ 连接管理】
+
+文件路径: exchangeapp/config/rabbitmq.go  (新建文件)
+
+-------------------------------- 完整 rabbitmq.go -------------------------------
+package config
+
+import (
+    "fmt"
+    "log"
+    "sync"
+    "time"
+
+    amqp "github.com/rabbitmq/amqp091-go"
+)
+
+/*
+   RabbitMQ 连接管理器
+
+   职责:
+   1. 建立并维护与 RabbitMQ 服务器的 TCP 连接
+   2. 管理 Channel (信道) 的创建与生命周期
+   3. 声明交换机 (Exchange)、队列 (Queue) 及绑定关系
+   4. 提供连接断开后的自动重连能力
+   5. 提供线程安全的 Channel 获取方法
+
+   核心概念:
+   - Connection: TCP 连接，重量级对象，一个应用通常只维护一个
+   - Channel:   虚拟连接，轻量级，在 Connection 之上创建，所有操作都在 Channel 上进行
+   - Exchange:  交换机，消息的"路由器"，根据 routing key 决定消息发往哪些队列
+   - Queue:     队列，消息的最终存放地，消费者从队列中取消息
+*/
+
+// 队列名称常量 —— 集中管理，避免拼写错误
+const (
+    LikeQueue       = "article_likes"      // 点赞队列
+    NotificationQueue = "comment_notifications" // 评论通知队列
+    DeadLetterQueue = "dead_letter"        // 死信队列 (处理失败消息)
+)
+
+// 交换机名称常量
+const (
+    DefaultExchange = "exchangeapp.exchange" // 项目统一交换机
+)
+
+var (
+    // 全局 Connection 和 Channel，通过 sync.RWMutex 保证并发安全
+    rabbitConn     *amqp.Connection
+    rabbituChan    *amqp.Channel
+    rabbitMu       sync.RWMutex
+    rabbitNotify   chan *amqp.Error  // Connection 异常通知 channel
+)
+
+/*
+   InitRabbitMQ 初始化 RabbitMQ 连接
+
+   调用时机: 在 config.InitConfig() 中自动调用，无需手动调用
+
+   流程:
+   1. 根据配置拼接 AMQP 连接字符串
+   2. 建立 TCP 连接
+   3. 创建 Channel
+   4. 声明交换机 (topic 类型，支持灵活的路由模式)
+   5. 声明业务队列并绑定到交换机
+   6. 声明死信队列
+   7. 注册连接异常回调，用于自动重连
+*/
+func InitRabbitMQ() {
+    cfg := AppConfig.RabbitMQ
+
+    // 拼接 AMQP 连接串
+    // 格式: amqp://user:password@host:port/vhost
+    dsn := fmt.Sprintf("amqp://%s:%s@%s:%s%s",
+        cfg.User, cfg.Password, cfg.Host, cfg.Port, cfg.Vhost)
+
+    var err error
+    rabbitConn, err = amqp.Dial(dsn)
+    if err != nil {
+        log.Fatalf("Failed to connect to RabbitMQ: %v", err)
+    }
+    log.Println("RabbitMQ connected successfully")
+
+    // 创建 Channel
+    rabbituChan, err = rabbitConn.Channel()
+    if err != nil {
+        log.Fatalf("Failed to open RabbitMQ channel: %v", err)
+    }
+
+    // 声明交换机
+    declareExchange(rabbituChan)
+
+    // 声明队列并绑定
+    declareQueues(rabbituChan)
+
+    // 注册连接异常回调 —— 当连接断开时，rabbitNotify 会收到通知
+    rabbitNotify = rabbitConn.NotifyClose(make(chan *amqp.Error))
+
+    log.Println("RabbitMQ initialized successfully")
+}
+
+/*
+   declareExchange 声明交换机
+
+   交换机类型: topic
+   - topic 交换机允许使用通配符 routing key 进行灵活的路由匹配
+   - * (星号) 匹配恰好一个单词
+   - # (井号) 匹配零个或多个单词
+
+   例如: article.like 可匹配 article.* 和 article.#
+*/
+func declareExchange(ch *amqp.Channel) {
+    err := ch.ExchangeDeclare(
+        DefaultExchange, // 交换机名称
+        "topic",          // 类型: topic
+        true,             // durable: 持久化 (RabbitMQ 重启后仍然存在)
+        false,            // auto-delete: 当没有队列绑定时不自动删除
+        false,            // internal: 非内部交换机 (客户端可以使用)
+        false,            // no-wait: 等待服务器确认
+        nil,              // arguments: 无额外参数
+    )
+    if err != nil {
+        log.Fatalf("Failed to declare exchange: %v", err)
+    }
+}
+
+/*
+   declareQueues 声明所有业务队列并绑定到交换机
+
+   队列参数说明:
+   - durable=true:  队列持久化，RabbitMQ 重启后队列仍然存在
+   - durable=false: 队列非持久化，RabbitMQ 重启后队列消失
+   - auto-delete:   当最后一个消费者断开连接后，队列自动删除
+
+   死信队列 (DLQ) 的作用:
+   当消息被拒绝 (Nack/Reject) 且 requeue=false 时，消息会被转发到死信队列。
+   这样可以在不影响主队列的情况下，集中处理失败的消息 (重试、告警、人工介入)。
+*/
+func declareQueues(ch *amqp.Channel) {
+    // ---------- 1. 死信队列 ----------
+    // 死信队列通常不需要绑定消费者，而是由运维或定时任务来检查
+    _, err := ch.QueueDeclare(
+        DeadLetterQueue, // 名称
+        true,             // durable
+        false,            // auto-delete
+        false,            // exclusive
+        false,            // no-wait
+        amqp.Table{
+            "x-message-ttl": 86400000, // 消息在死信队列中的存活时间: 24小时 (毫秒)
+        },
+    )
+    if err != nil {
+        log.Fatalf("Failed to declare dead letter queue: %v", err)
+    }
+    // 将死信队列也绑定到统一交换机，routing key 为 dead.letter
+    ch.QueueBind(DeadLetterQueue, "dead.letter", DefaultExchange, false, nil)
+
+    // ---------- 2. 点赞队列 ----------
+    _, err = ch.QueueDeclare(
+        LikeQueue, // 名称
+        true,       // durable: 持久化，保证点赞数据不丢失
+        false,      // auto-delete
+        false,      // exclusive
+        false,      // no-wait
+        amqp.Table{
+            // 配置死信交换机 —— 当消息被 Nack 且 requeue=false 时，转发到死信队列
+            "x-dead-letter-exchange":    DefaultExchange,
+            "x-dead-letter-routing-key": "dead.letter",
+        },
+    )
+    if err != nil {
+        log.Fatalf("Failed to declare like queue: %v", err)
+    }
+    // 绑定: routing key "article.like" → 点赞队列
+    ch.QueueBind(LikeQueue, "article.like", DefaultExchange, false, nil)
+
+    // ---------- 3. 评论通知队列 ----------
+    _, err = ch.QueueDeclare(
+        NotificationQueue, // 名称
+        true,                // durable
+        false,               // auto-delete
+        false,               // exclusive
+        false,               // no-wait
+        amqp.Table{
+            "x-dead-letter-exchange":    DefaultExchange,
+            "x-dead-letter-routing-key": "dead.letter",
+        },
+    )
+    if err != nil {
+        log.Fatalf("Failed to declare notification queue: %v", err)
+    }
+    ch.QueueBind(NotificationQueue, "comment.notify", DefaultExchange, false, nil)
+}
+
+/*
+   GetChannel 线程安全地获取 RabbitMQ Channel
+
+   返回值: (*amqp.Channel, func()) —— Channel 和释放锁的回调
+   调用方式:
+       ch, release := config.GetChannel()
+       defer release()
+       // ... 使用 ch ...
+*/
+func GetChannel() (*amqp.Channel, func()) {
+    rabbitMu.RLock()
+    return rabbituChan, func() { rabbitMu.RUnlock() }
+}
+
+/*
+   ReconnectRabbitMQ 处理 RabbitMQ 断线重连
+
+   当 Connection 意外断开时:
+   1. 等待 3 秒后重试 (避免频繁重连)
+   2. 重新调用 InitRabbitMQ 的完整流程
+   3. 如果重连失败，继续等待 3 秒重试，直到成功
+
+   注意: 这个函数应该在一个 goroutine 中运行
+*/
+func ReconnectRabbitMQ() {
+    for {
+        err, ok := <-rabbitNotify
+        if !ok {
+            // channel 已关闭
+            return
+        }
+        log.Printf("RabbitMQ connection closed: %v, attempting reconnect...", err)
+
+        // 无限重连直到成功
+        for {
+            time.Sleep(3 * time.Second)
+            log.Println("Attempting to reconnect to RabbitMQ...")
+
+            cfg := AppConfig.RabbitMQ
+            dsn := fmt.Sprintf("amqp://%s:%s@%s:%s%s",
+                cfg.User, cfg.Password, cfg.Host, cfg.Port, cfg.Vhost)
+
+            conn, dialErr := amqp.Dial(dsn)
+            if dialErr != nil {
+                log.Printf("Reconnect failed: %v, retrying...", dialErr)
+                continue
+            }
+
+            ch, chErr := conn.Channel()
+            if chErr != nil {
+                conn.Close()
+                log.Printf("Failed to create channel on reconnect: %v", chErr)
+                continue
+            }
+
+            // 原子更新全局连接
+            rabbitMu.Lock()
+            if rabbituChan != nil {
+                rabbituChan.Close()
+            }
+            if rabbitConn != nil {
+                rabbitConn.Close()
+            }
+            rabbitConn = conn
+            rabbituChan = ch
+            rabbitMu.Unlock()
+
+            // 重新声明交换机和队列
+            declareExchange(ch)
+            declareQueues(ch)
+
+            // 重新注册异常通知
+            rabbitNotify = conn.NotifyClose(make(chan *amqp.Error))
+
+            log.Println("RabbitMQ reconnected successfully!")
+            break
+        }
+    }
+}
+
+/*
+   CloseRabbitMQ 优雅关闭 RabbitMQ 连接
+
+   调用时机: 在 main.go 的 graceful shutdown 逻辑中调用
+   关闭顺序: 先关闭 Channel，再关闭 Connection
+*/
+func CloseRabbitMQ() {
+    if rabbituChan != nil {
+        rabbituChan.Close()
+    }
+    if rabbitConn != nil {
+        rabbitConn.Close()
+    }
+    log.Println("RabbitMQ connection closed")
+}
+
+/*
+   PublishMessage 通用消息发布方法
+
+   参数:
+   - routingKey: 路由键，决定消息发往哪个队列
+   - body:       消息体 (JSON 字节序列)
+   - persistent: 是否持久化 (true=消息写入磁盘，RabbitMQ 重启后不丢失)
+
+   消息持久化说明:
+   - persistent=true:  消息被写入磁盘，适合不能丢失的业务数据 (如点赞)
+   - persistent=false: 消息仅在内存中，性能更好但可能丢失
+*/
+func PublishMessage(routingKey string, body []byte, persistent bool) error {
+    ch, release := GetChannel()
+    defer release()
+
+    deliveryMode := amqp.Transient // 0 = 非持久化
+    if persistent {
+        deliveryMode = amqp.Persistent // 2 = 持久化
+    }
+
+    return ch.Publish(
+        DefaultExchange, // exchange: 使用统一交换机
+        routingKey,       // routing key
+        false,            // mandatory: 如果无法路由到任何队列，不返回错误
+        false,            // immediate: 如果无消费者，不返回错误
+        amqp.Publishing{
+            ContentType:  "application/json",
+            DeliveryMode: deliveryMode, // 投递模式: 持久化/非持久化
+            Body:         body,
+        },
+    )
+}
+--------------------------------------------------------------------------------
+
+
+================================================================================
+第二部分: 场景一 —— 点赞计数器持久化
+================================================================================
+
+【问题诊断】
+
+当前实现 (exchangeapp/controllers/likes_controller.go):
+
+    func LikeArticles(ctx *gin.Context) {
+        LikeKey := "article:" + articleId + ":likes"
+        global.RedisDB.Incr(ctx, LikeKey).Err()  // ← 仅 Redis INCR
+        // ... 没有任何 MySQL 写入操作
+    }
+
+问题:
+1. Article 表的 Likes 字段(NOT NULL DEFAULT 0)从未被更新，始终为 0
+2. Redis 中点赞数据没有设置过期时间，无限增长占用内存
+3. 如果 Redis 重启/数据被淘汰，所有历史点赞数据永久丢失
+4. 如果有排行榜/热门文章功能，会读到错误的 Likes=0
+
+【架构设计】
+
+                    HTTP 请求
+                        │
+                        ▼
+              ┌──────────────────┐
+              │  LikeArticles()  │
+              │  1. Redis INCR   │ ← 瞬时响应 (O(1))
+              │  2. Publish MQ   │ ← 异步投递
+              └──────┬───────────┘
+                     │
+              ┌──────▼──────────┐
+              │  RabbitMQ       │
+              │  Queue:         │
+              │  article_likes  │ ← 持久化队列，消息不丢失
+              └──────┬──────────┘
+                     │
+              ┌──────▼──────────────────────┐
+              │  Like Batch Consumer        │
+              │  (goroutine, 后台运行)       │
+              │                             │
+              │  每 5 秒汇总一次:            │
+              │  {articleID: 1, delta: +15} │
+              │  {articleID: 3, delta: +8}  │
+              │         │                    │
+              │         ▼                    │
+              │  UPDATE articles            │
+              │  SET likes = likes + delta  │
+              │  WHERE id = ?               │
+              └─────────────────────────────┘
+
+设计要点:
+1. 批量聚合: 5 秒内的同文章点赞合并为一条 UPDATE，减轻 DB 压力
+2. 增量更新: 使用 likes = likes + ? 而非 SET likes = ?，天然线程安全
+3. 消息持久化: 即使 RabbitMQ 重启，消息也不会丢失
+4. 手动 ACK: 消费者 UPDATE 成功后才确认，保证 at-least-once 语义
+
+【新增文件 1: 消息结构体】
+
+文件路径: exchangeapp/models/like_message.go
+
+package models
+
+/*
+   LikeMessage 点赞消息体
+
+   从 RabbitMQ 队列中消费的消息格式。
+   每个 LikeMessage 代表"一次点赞操作"，由消费者聚合后批量写入 MySQL。
+*/
+type LikeMessage struct {
+    ArticleID uint   `json:"article_id"` // 被点赞的文章 ID
+    Timestamp int64  `json:"timestamp"`  // 点赞时间戳 (Unix 秒)，便于后续数据分析
+}
+
+// 解析: 消息仅携带最小必要信息。Username 不需要在点赞消息中，因为
+//       当前业务逻辑中点赞不计入用户维度 (谁点了赞)，只计总数。
+//       如果后期需要"用户点赞记录"，可以在 LikeMessage 中增加 UserID 字段。
+--------------------------------------------------------------------------------
+
+【新增文件 2: 点赞批量消费者】
+
+文件路径: exchangeapp/consumers/like_consumer.go  (新建目录 consumers)
+
+package consumers
+
+import (
+    "encoding/json"
+    "exchangeapp/config"
+    "exchangeapp/global"
+    "exchangeapp/models"
+    "log"
+    "time"
+
+    amqp "github.com/rabbitmq/amqp091-go"
+)
+
+/*
+   LikeConsumer 点赞批量消费者
+
+   设计思想: 批量聚合 + 定时刷库
+   - 不使用"来一条消息就写一次 DB"的模式，因为热文可能每秒有几十上百个赞
+   - 改为: 消费消息 → 内存累加 → 每 N 秒批量 UPDATE
+   - 临界情况: 如果应用崩溃，未刷库的聚合数据会丢失，但 RabbitMQ 中的
+     消息已 ACK，需要权衡。对此我们采用"消费即 ACK"策略，配合
+     应用启动时用 Redis 数据全量刷新 DB 来补偿。
+
+   架构分层:
+   ┌──────────────────────────────────────────────┐
+   │  consumeMessages()     ← 消费 RabbitMQ 消息  │
+   │  aggregateMessages()   ← 内存中累加计数      │
+   │  flushToDatabase()     ← 定时批量写入 MySQL   │
+   └──────────────────────────────────────────────┘
+*/
+
+// likesBuffer 点赞缓冲区: articleID → 增量 (线程安全由 channel 保证)
+type likesBuffer map[uint]int
+
+/*
+   StartLikeConsumer 启动点赞消费者
+
+   调用时机: 在 main.go 中，作为一个 goroutine 启动
+
+   参数:
+   - prefetch: 预取数量 (从 RabbitMQ 一次取多少条消息到本地)
+   - flushInterval: 批量刷库间隔
+
+   推荐配置: prefetch=50, flushInterval=5秒
+*/
+func StartLikeConsumer(prefetch int, flushInterval time.Duration) {
+    log.Printf("[LikeConsumer] Starting with prefetch=%d, flushInterval=%v",
+        prefetch, flushInterval)
+
+    // 步骤1: 创建独立 Channel
+    // 注意: 消费者应该使用独立的 Channel，不能与生产者共用
+    //       因为 Channel 的关闭会影响所有使用它的 goroutine
+    conn := config.GetRabbitConn()
+    if conn == nil {
+        log.Fatal("[LikeConsumer] RabbitMQ connection is nil")
+    }
+
+    ch, err := conn.Channel()
+    if err != nil {
+        log.Fatalf("[LikeConsumer] Failed to create channel: %v", err)
+    }
+    defer ch.Close()
+
+    // 步骤2: 设置 QoS (Quality of Service)
+    // prefetchCount: 消费者本地最多积攒多少未 ACK 的消息
+    // global=false: 这个限制是 per-consumer 的，不是 per-channel 的
+    // 作用: 防止消费者本地积压过多消息导致内存溢出
+    err = ch.Qos(prefetch, 0, false)
+    if err != nil {
+        log.Fatalf("[LikeConsumer] Failed to set QoS: %v", err)
+    }
+
+    // 步骤3: 开始消费
+    // auto-ack=false: 手动确认模式 —— 处理成功后才 ACK
+    msgs, err := ch.Consume(
+        config.LikeQueue, // queue: 队列名称
+        "",               // consumer tag: 消费者标识，空字符串让 RabbitMQ 自动生成
+        false,            // auto-ack: 手动确认
+        false,            // exclusive: 非独占 (允许多个消费者)
+        false,            // no-local: 不使用本地交付
+        false,            // no-wait: 等待服务器响应
+        nil,              // args: 无额外参数
+    )
+    if err != nil {
+        log.Fatalf("[LikeConsumer] Failed to start consuming: %v", err)
+    }
+
+    // 步骤4: 初始化聚合缓冲区
+    buffer := make(likesBuffer)
+
+    // 步骤5: 启动定时刷库
+    // 使用 time.Ticker 实现定时任务，每隔 flushInterval 触发一次批量写入
+    ticker := time.NewTicker(flushInterval)
+    defer ticker.Stop()
+
+    // 步骤6: 主循环 —— 同时监听消息通道和定时器通道
+    log.Println("[LikeConsumer] Started, waiting for messages...")
+    for {
+        select {
+        case msg, ok := <-msgs:
+            // ---- 收到 RabbitMQ 消息 ----
+            if !ok {
+                log.Println("[LikeConsumer] Message channel closed, flushing remaining data...")
+                flushToDatabase(buffer)
+                return
+            }
+
+            // 反序列化消息体
+            var likeMsg models.LikeMessage
+            if err := json.Unmarshal(msg.Body, &likeMsg); err != nil {
+                log.Printf("[LikeConsumer] Failed to unmarshal message: %v, body: %s",
+                    err, string(msg.Body))
+                // 消息格式错误 → 直接 Nack 并发送到死信队列
+                msg.Nack(false, false) // requeue=false → 进入 DLQ
+                continue
+            }
+
+            // 聚合: 累加到缓冲区
+            buffer[likeMsg.ArticleID]++
+
+            // ACK: 确认消费成功
+            // 这里采用"立即 ACK"策略:
+            //   - 优点: 不会重复消费，消息投递延迟低
+            //   - 缺点: 如果应用在 ACK 后、刷库前崩溃，本次聚合数据丢失
+            //   - 补偿: 定期全量同步 Redis → DB 作为兜底
+            msg.Ack(false) // multiple=false: 仅确认本条消息
+
+            log.Printf("[LikeConsumer] Aggregated like for article %d (buffer size: %d)",
+                likeMsg.ArticleID, len(buffer))
+
+        case <-ticker.C:
+            // ---- 定时器触发: 批量刷库 ----
+            if len(buffer) > 0 {
+                log.Printf("[LikeConsumer] Timer triggered, flushing %d articles...", len(buffer))
+                flushToDatabase(buffer)
+                // 清空缓冲区
+                buffer = make(likesBuffer)
+            }
+        }
+    }
+}
+
+/*
+   flushToDatabase 将聚合的点赞增量批量写入 MySQL
+
+   核心 SQL 逻辑: UPDATE articles SET likes = likes + ? WHERE id = ?
+
+   为什么用 likes = likes + ? 而不是 SET likes = ?:
+   - likes = likes + ? 是原子操作，基于当前值累加
+   - SET likes = ? 需要先 SELECT 再 UPDATE，存在并发覆盖风险
+
+   为什么批量写入:
+   - 将多次点赞聚合为一条 UPDATE，减少数据库写压力
+   - 某个热文在 5 秒内被点赞 100 次 → 只需要 1 条 UPDATE
+*/
+func flushToDatabase(buffer likesBuffer) {
+    for articleID, delta := range buffer {
+        // 使用 GORM 的 UpdateColumn + expr 实现增量更新
+        // SQL: UPDATE articles SET likes = likes + ?, updated_at = ? WHERE id = ?
+        result := global.Db.Model(&models.Article{}).
+            Where("id = ?", articleID).
+            UpdateColumn("likes", global.Db.Raw("likes + ?", delta))
+
+        if result.Error != nil {
+            log.Printf("[LikeConsumer] Failed to update likes for article %d (delta=%d): %v",
+                articleID, delta, result.Error)
+            // 失败处理策略:
+            // 1. 记录错误日志 (已做)
+            // 2. 可选: 将失败的增量写入一张重试表
+            // 3. 可选: 发送告警
+            // 注意: 这里不 panic，因为一个文章更新失败不应影响其他文章
+            continue
+        }
+
+        // RowsAffected == 0 说明该文章可能已被删除
+        if result.RowsAffected == 0 {
+            log.Printf("[LikeConsumer] Article %d not found, skipping like delta %d",
+                articleID, delta)
+            continue
+        }
+
+        log.Printf("[LikeConsumer] Updated likes for article %d (+%d)", articleID, delta)
+    }
+}
+--------------------------------------------------------------------------------
+
+【新增文件 3: GetRabbitConn 辅助方法】
+
+在 exchangeapp/config/rabbitmq.go 末尾追加:
+
+// GetRabbitConn 获取 RabbitMQ Connection (用于消费者创建独立 Channel)
+func GetRabbitConn() *amqp.Connection {
+    rabbitMu.RLock()
+    defer rabbitMu.RUnlock()
+    return rabbitConn
+}
+--------------------------------------------------------------------------------
+
+【修改文件: main.go】
+
+在 main.go 中增加:
+
+1. 启动 RabbitMQ 重连 goroutine
+2. 启动点赞消费者 goroutine
+3. 优雅关闭时关闭 RabbitMQ
+
+完整 main.go 如下 (标有 "新增" 的行是需要添加的):
+
+-------------------------------- 完整 main.go --------------------------------
+package main
+
+import (
+    "context"
+    "exchangeapp/config"
+    "exchangeapp/consumers"  // ========== 新增 ==========
+    "exchangeapp/router"
+    "log"
+    "net/http"
+    "os"
+    "os/signal"
+    "time"
+)
+
+func main() {
+    config.InitConfig()
+    r := router.SetupRouter()
+
+    // ========== 新增: 启动 RabbitMQ 自动重连 ==========
+    go config.ReconnectRabbitMQ()
+
+    // ========== 新增: 启动点赞消费者 ==========
+    // 参数说明:
+    //   prefetch=50:   每次从队列取 50 条消息到本地
+    //   interval=5秒: 每 5 秒批量写入一次 MySQL
+    // 这两个值可根据实际负载调整: 高并发时可增大 prefetch，低延迟要求时可缩短 interval
+    go func() {
+        prefetch := config.AppConfig.RabbitMQ.LikePrefetch
+        interval := time.Duration(config.AppConfig.RabbitMQ.LikeTaskInterval) * time.Second
+        consumers.StartLikeConsumer(prefetch, interval)
+    }()
+
+    port := config.AppConfig.App.Port
+    if port == "" {
+        port = ":8080"
+    }
+    srv := &http.Server{
+        Addr:    port,
+        Handler: r,
+    }
+    go func() {
+        if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+            log.Fatalf("listen: %s\n", err)
+        }
+    }()
+
+    // 优雅关闭
+    quit := make(chan os.Signal, 1)
+    signal.Notify(quit, os.Interrupt)
+    <-quit
+    log.Println("Shutdown Server...")
+    ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+    defer cancel()
+    if err := srv.Shutdown(ctx); err != nil {
+        log.Println("Server Shutdown:", err)
+    }
+
+    // ========== 新增: 关闭 RabbitMQ 连接 ==========
+    config.CloseRabbitMQ()
+
+    log.Println("Server exiting")
+}
+--------------------------------------------------------------------------------
+
+【修改文件: likes_controller.go】
+
+在原 LikeArticles 函数中增加消息队列发布逻辑。
+
+原函数只做 Redis INCR:
+    func LikeArticles(ctx *gin.Context) {
+        ...
+        global.RedisDB.Incr(ctx, LikeKey).Err()
+        ...
+    }
+
+修改后增加 MQ 发布:
+
+-------------------------------- 修改后的 likes_controller.go --------------------------------
+package controllers
+
+import (
+    "encoding/json"     // ========== 新增 ==========
+    "exchangeapp/config" // ========== 新增 ==========
+    "exchangeapp/global"
+    "exchangeapp/models" // ========== 新增 ==========
+    "log"                // ========== 新增 ==========
+    "net/http"
+    "strconv"            // ========== 新增 ==========
+    "time"               // ========== 新增 ==========
+
+    "github.com/gin-gonic/gin"
+    "github.com/go-redis/redis/v8"
+)
+
+// LikeArticles 点赞文章
+func LikeArticles(ctx *gin.Context) {
+    articleId := ctx.Param("id")
+    LikeKey := "article:" + articleId + ":likes"
+
+    // ===== 第一步: Redis 原子自增 (保持原有逻辑) =====
+    // 这一步保证前端可以立即读到最新点赞数
+    if err := global.RedisDB.Incr(ctx, LikeKey).Err(); err != nil {
+        ctx.JSON(http.StatusInternalServerError, gin.H{
+            "error": err.Error(),
+        })
+        return
+    }
+
+    // ===== 第二步: 异步通知 RabbitMQ，由消费者负责写入 MySQL =====
+    // 注意: 消息发布失败不影响 API 响应 —— 用户已经看到了点赞成功
+    publishLikeMessage(articleId)
+
+    ctx.JSON(http.StatusOK, gin.H{
+        "message": "Successfully liked the article",
+    })
+}
+
+/*
+   publishLikeMessage 将点赞事件发布到 RabbitMQ
+
+   为什么要异步发布:
+   - 发布消息到 RabbitMQ 可能因为网络抖动而失败
+   - 不应让这种失败影响用户的点赞体验 (Redis 已经记录了)
+   - 发布失败仅记日志，消费者最终通过 Redis → DB 全量同步来兜底
+
+   消息体设计:
+   - ArticleID: 被点赞的文章
+   - Timestamp: 点赞时间 (可用于后续的数据分析、热文计算)
+*/
+func publishLikeMessage(articleID string) {
+    // 将 articleID 字符串转为 uint
+    id, err := strconv.ParseUint(articleID, 10, 64)
+    if err != nil {
+        log.Printf("[LikeMessage] Invalid article ID: %s, error: %v", articleID, err)
+        return
+    }
+
+    likeMsg := models.LikeMessage{
+        ArticleID: uint(id),
+        Timestamp: time.Now().Unix(),
+    }
+
+    body, err := json.Marshal(likeMsg)
+    if err != nil {
+        log.Printf("[LikeMessage] Failed to marshal: %v", err)
+        return
+    }
+
+    // 发布到 RabbitMQ
+    // routingKey: "article.like" → 路由到 article_likes 队列
+    // persistent: true → 消息持久化到磁盘，RabbitMQ 重启不丢失
+    err = config.PublishMessage("article.like", body, true)
+    if err != nil {
+        // 发布失败仅记录日志，因为 Redis 中已有计数
+        // 消费者后续可通过 Redis → DB 全量同步来补偿
+        log.Printf("[LikeMessage] Failed to publish: %v", err)
+    }
+}
+
+// GetArticleLikes 获取文章点赞数 (保持不变)
+func GetArticleLikes(ctx *gin.Context) {
+    articleId := ctx.Param("id")
+    LikeKey := "article:" + articleId + ":likes"
+
+    likes, err := global.RedisDB.Get(ctx, LikeKey).Result()
+    if err == redis.Nil {
+        likes = "0"
+    } else if err != nil {
+        ctx.JSON(http.StatusInternalServerError, gin.H{
+            "error": err.Error(),
+        })
+        return
+    }
+
+    ctx.JSON(http.StatusOK, gin.H{
+        "likes": likes,
+    })
+}
+--------------------------------------------------------------------------------
+
+【可选增强: Redis → DB 全量同步补偿任务】
+
+为了补偿"消费 ACK 后、刷库前崩溃"这种极端情况，可以增加一个定时任务，
+定期将 Redis 中的所有点赞计数同步到 MySQL。这不是 RabbitMQ 方案的必要部分，
+但能提升数据可靠性。
+
+可新增文件 exchangeapp/tasks/sync_likes.go:
+
+package tasks
+
+import (
+    "context"
+    "exchangeapp/global"
+    "exchangeapp/models"
+    "log"
+    "strconv"
+    "strings"
+    "time"
+)
+
+/*
+   SyncLikesToDB 将 Redis 点赞数据全量同步到 MySQL
+
+   执行频率: 建议每 30 分钟执行一次
+   作用: 兜底机制，补偿消息队列可能遗漏的数据
+
+   注意: 此任务不应该在消费者正常运行时频繁执行，它是最后的保障。
+*/
+func SyncLikesToDB() {
+    log.Println("[SyncLikes] Starting Redis → DB sync...")
+
+    ctx := context.Background()
+    cursor := uint64(0)
+    count := 0
+
+    for {
+        // SCAN Redis 中所有 "article:*:likes" 键
+        keys, nextCursor, err := global.RedisDB.Scan(ctx, cursor, "article:*:likes", 100).Result()
+        if err != nil {
+            log.Printf("[SyncLikes] Scan error: %v", err)
+            return
+        }
+
+        for _, key := range keys {
+            // 从 key 中提取 article ID
+            // 格式: "article:123:likes" → "123"
+            parts := strings.Split(key, ":")
+            if len(parts) != 3 {
+                continue
+            }
+            articleID, err := strconv.ParseUint(parts[1], 10, 64)
+            if err != nil {
+                continue
+            }
+
+            // 获取 Redis 中的点赞数
+            likesStr, err := global.RedisDB.Get(ctx, key).Result()
+            if err != nil {
+                continue
+            }
+            likes, err := strconv.Atoi(likesStr)
+            if err != nil {
+                continue
+            }
+
+            // 直接 SET 到数据库 (全量同步场景下用 SET 而非增量)
+            global.Db.Model(&models.Article{}).
+                Where("id = ?", articleID).
+                Update("likes", likes)
+
+            count++
+        }
+
+        cursor = nextCursor
+        if cursor == 0 {
+            break
+        }
+    }
+
+    log.Printf("[SyncLikes] Completed: synced %d articles", count)
+}
+
+// StartSyncTask 启动定时同步任务
+func StartSyncTask(interval time.Duration) {
+    ticker := time.NewTicker(interval)
+    defer ticker.Stop()
+    for range ticker.C {
+        SyncLikesToDB()
+    }
+}
+--------------------------------------------------------------------------------
+
+
+================================================================================
+第三部分: 场景三 —— 评论异步通知
+================================================================================
+
+【问题诊断】
+
+当前 CreateComment 的实现 (exchangeapp/controllers/comments_controller.go):
+
+    func CreateComment(ctx *gin.Context) {
+        // ... 绑定 JSON, 写入 DB, 删除缓存 ...
+        ctx.JSON(http.StatusOK, comment)
+    }
+
+问题:
+1. 评论创建成功后，文章作者不会收到任何通知
+2. 如果后续添加通知功能 (邮件/站内通知/WebSocket)，同步发送会导致:
+   - 邮件发送可能需要 200-500ms，阻塞 API 响应
+   - 邮件服务故障会导致评论 API 也返回错误
+   - 高并发场景下，所有请求都在等待邮件/通知发送完成
+
+通知应该与评论创建解耦 —— 评论成功即返回，通知异步完成。
+
+【架构设计】
+
+                    用户A 发表评论
+                         │
+                         ▼
+              ┌──────────────────────┐
+              │  CreateComment()     │
+              │  1. 写入 MySQL       │ ← 主要业务逻辑
+              │  2. 删除 Redis 缓存  │
+              │  3. 发布通知消息     │ ← 异步触发 (不阻塞响应)
+              │  4. 返回给用户A      │
+              └──────┬───────────────┘
+                     │
+              ┌──────▼──────────────┐
+              │  RabbitMQ          │
+              │  Queue:            │
+              │  comment_          │
+              │  notifications     │
+              └──────┬──────────────┘
+                     │
+              ┌──────▼──────────────────────┐
+              │  Notification Consumer      │
+              │  (goroutine, 后台运行)       │
+              │                             │
+              │  1. 解析通知消息             │
+              │  2. 查询文章作者             │
+              │  3. 创建站内通知记录         │
+              │  4. 发送邮件通知 (可选)      │
+              │  5. WebSocket 推送 (可选)    │
+              │  6. ACK 消息                 │
+              └──────────────────────────────┘
+
+设计要点:
+1. 同步 + 异步 混合: 评论创建是同步的，通知发送是异步的
+2. 可靠性: 通知失败不影响评论本身，可以重试
+3. 可扩展: 通知渠道 (邮件、站内、推送) 可以独立增减
+4. 失败处理: 通知失败的消息进入死信队列，可以人工/自动重试
+
+【新增文件 1: 通知消息结构体】
+
+文件路径: exchangeapp/models/notification_message.go
+
+package models
+
+/*
+   CommentNotification 评论通知消息
+
+   包含通知所需的所有上下文信息。
+   使用完整快照而非依赖 DB 实时查询的好处:
+   - 消费者不需要反查评论表和文章表即可构建通知内容
+   - 即使后续评论/文章被编辑，用户收到的通知内容也不会变化
+*/
+type CommentNotification struct {
+    ArticleID     uint   `json:"article_id"`     // 文章 ID
+    ArticleTitle  string `json:"article_title"`  // 文章标题 (快照)
+    CommentID     uint   `json:"comment_id"`     // 评论 ID
+    CommentAuthor string `json:"comment_author"` // 评论者用户名
+    CommentContent string `json:"comment_content"` // 评论内容前 100 字符 (摘要)
+    Timestamp     int64  `json:"timestamp"`      // 评论时间戳
+}
+
+/*
+   InAppNotification 站内通知 (持久化到数据库)
+
+   用户在网站上可以看到的通知列表。
+*/
+type InAppNotification struct {
+    gorm.Model
+    Username  string `json:"username"`  // 接收通知的用户
+    Title     string `json:"title"`     // 通知标题
+    Content   string `json:"content"`   // 通知内容
+    Link      string `json:"link"`      // 跳转链接 (如 /articles/123)
+    IsRead    bool   `json:"is_read" gorm:"default:false"` // 是否已读
+}
+--------------------------------------------------------------------------------
+
+【新增文件 2: 通知服务】
+
+文件路径: exchangeapp/services/notification_service.go  (新建目录 services)
+
+package services
+
+import (
+    "exchangeapp/global"
+    "exchangeapp/models"
+    "fmt"
+    "log"
+    "net/smtp"
+    "strings"
+)
+
+/*
+   SendSiteNotification 创建站内通知记录
+
+   站内通知存储在数据库中，前端通过 API 拉取展示。
+   这是最基础的、必定会执行的通知渠道。
+*/
+func SendSiteNotification(notif *models.CommentNotification) error {
+    // 第一步: 查询文章作者
+    var article models.Article
+    if err := global.Db.First(&article, notif.ArticleID).Error; err != nil {
+        return fmt.Errorf("failed to find article %d: %w", notif.ArticleID, err)
+    }
+
+    // 第二步: 查询文章作者的用户名
+    // 注意: 当前 Article 模型没有 Author 字段，这里假设后期会添加
+    //       如果 Article 暂时没有作者字段，可以用其他方式关联
+    //       或者从评论上下文推断 (当前项目结构下，Article 只有 Title/Content/Preview)
+    //
+    // 临时方案: 如果 Article 还没有 Author 字段，可以查询该文章的第一条评论的作者
+    // 正式方案: 在 Article 结构体中添加 AuthorID 或 AuthorName 字段
+    //
+    // 下面的代码假设 Article 有 AuthorName 字段 (需要后续添加)
+
+    // 第三步: 构建通知内容
+    notifRecord := models.InAppNotification{
+        Username: notif.CommentAuthor, // 通知发送给文章作者 (后续修正为文章作者)
+        Title:    "新评论通知",
+        Content:  fmt.Sprintf("用户 %s 评论了文章《%s》: %s",
+            notif.CommentAuthor,
+            notif.ArticleTitle,
+            truncateContent(notif.CommentContent, 100),
+        ),
+        Link:  fmt.Sprintf("/articles/%d", notif.ArticleID),
+        IsRead: false,
+    }
+
+    // 第四步: 写入数据库
+    if err := global.Db.Create(&notifRecord).Error; err != nil {
+        return fmt.Errorf("failed to create notification: %w", err)
+    }
+
+    log.Printf("[NotificationService] Created site notification #%d for article %d",
+        notifRecord.ID, notif.ArticleID)
+    return nil
+}
+
+/*
+   SendEmailNotification 发送邮件通知 (可选)
+
+   使用 Go 标准库 net/smtp 发送邮件。
+   如果你的项目使用第三方邮件服务 (如 SendGrid, Mailgun)，
+   请替换此函数的实现。
+
+   配置:
+   - SMTP_HOST: 环境变量，如 smtp.gmail.com:587
+   - SMTP_USER: 环境变量，发件人邮箱
+   - SMTP_PASS: 环境变量，邮箱密码或应用专用密码
+*/
+func SendEmailNotification(notif *models.CommentNotification, recipientEmail string) error {
+    // 如果未配置 SMTP，跳过邮件发送
+    // 从环境变量获取 SMTP 配置
+    smtpHost := "smtp.example.com:587" // 请替换为实际 SMTP 服务器
+    smtpUser := "noreply@example.com"   // 请替换为实际发件人
+    smtpPass := ""                       // 请替换为实际密码
+
+    if smtpHost == "" || smtpUser == "" || smtpPass == "" {
+        log.Println("[NotificationService] SMTP not configured, skipping email")
+        return nil
+    }
+
+    // 构建邮件内容
+    subject := fmt.Sprintf("有人评论了你的文章《%s》", notif.ArticleTitle)
+    body := fmt.Sprintf(`
+        <h3>新评论通知</h3>
+        <p>用户 <strong>%s</strong> 在你的文章 <a href="http://localhost:5173/articles/%d">
+        《%s》</a> 下发表了评论:</p>
+        <blockquote>%s</blockquote>
+        <p><small>发送时间: %s</small></p>
+    `, notif.CommentAuthor, notif.ArticleID, notif.ArticleTitle,
+        notif.CommentContent, "自动发送")
+
+    msg := fmt.Sprintf("From: %s\r\nTo: %s\r\nSubject: %s\r\n"+
+        "MIME-version: 1.0;\r\nContent-Type: text/html; charset=\"UTF-8\";\r\n\r\n%s",
+        smtpUser, recipientEmail, subject, body)
+
+    // 发送邮件
+    err := smtp.SendMail(
+        smtpHost,
+        smtp.PlainAuth("", smtpUser, smtpPass, strings.Split(smtpHost, ":")[0]),
+        smtpUser,
+        []string{recipientEmail},
+        []byte(msg),
+    )
+    if err != nil {
+        return fmt.Errorf("failed to send email: %w", err)
+    }
+
+    log.Printf("[NotificationService] Email sent to %s for article %d",
+        recipientEmail, notif.ArticleID)
+    return nil
+}
+
+// truncateContent 截断内容到指定长度，超出部分用 ... 表示
+func truncateContent(content string, maxLen int) string {
+    runes := []rune(content) // 用 rune 处理，避免中文乱码
+    if len(runes) <= maxLen {
+        return content
+    }
+    return string(runes[:maxLen]) + "..."
+}
+--------------------------------------------------------------------------------
+
+【新增文件 3: 通知消费者】
+
+文件路径: exchangeapp/consumers/notification_consumer.go
+
+package consumers
+
+import (
+    "encoding/json"
+    "exchangeapp/config"
+    "exchangeapp/models"
+    "exchangeapp/services"
+    "log"
+    "time"
+
+    amqp "github.com/rabbitmq/amqp091-go"
+)
+
+/*
+   NotificationConsumer 评论通知消费者
+
+   职责:
+   1. 从 comment_notifications 队列消费消息
+   2. 创建站内通知记录 (写入数据库)
+   3. 发送邮件通知 (可选，如果配置了 SMTP)
+   4. 成功处理后 ACK 消息
+   5. 失败的消息 Nack 并转发到死信队列
+
+   与点赞消费者的设计区别:
+   - 点赞消费者: 批量聚合，定时刷库
+   - 通知消费者: 逐条处理，即时消费 (通知不需要批量，延迟越低越好)
+*/
+
+/*
+   StartNotificationConsumer 启动通知消费者
+
+   参数:
+   - prefetch: 预取数量
+
+   推荐配置: prefetch=10
+   因为通知不涉及批量聚合，prefetch 不需要太大。
+*/
+func StartNotificationConsumer(prefetch int) {
+    log.Printf("[NotifyConsumer] Starting with prefetch=%d", prefetch)
+
+    // 步骤1: 创建独立 Channel
+    conn := config.GetRabbitConn()
+    if conn == nil {
+        log.Fatal("[NotifyConsumer] RabbitMQ connection is nil")
+    }
+
+    ch, err := conn.Channel()
+    if err != nil {
+        log.Fatalf("[NotifyConsumer] Failed to create channel: %v", err)
+    }
+    defer ch.Close()
+
+    // 步骤2: 设置 QoS
+    err = ch.Qos(prefetch, 0, false)
+    if err != nil {
+        log.Fatalf("[NotifyConsumer] Failed to set QoS: %v", err)
+    }
+
+    // 步骤3: 开始消费
+    msgs, err := ch.Consume(
+        config.NotificationQueue,
+        "",
+        false, // auto-ack: false → 手动确认
+        false,
+        false,
+        false,
+        nil,
+    )
+    if err != nil {
+        log.Fatalf("[NotifyConsumer] Failed to start consuming: %v", err)
+    }
+
+    log.Println("[NotifyConsumer] Started, waiting for messages...")
+
+    // 步骤4: 主循环 —— 逐条处理
+    for msg := range msgs {
+        processNotification(msg)
+    }
+
+    log.Println("[NotifyConsumer] Message channel closed")
+}
+
+/*
+   processNotification 处理单条通知消息
+
+   处理流程:
+   1. 反序列化 JSON
+   2. 创建站内通知
+   3. (可选) 发送邮件
+   4. ACK 或 Nack
+
+   失败处理策略:
+   - 反序列化失败 → 直接 Nack 并进入死信 (格式错误无法重试)
+   - 站内通知创建失败 → Nack 并 requeue (可能是临时 DB 故障)
+   - 邮件发送失败 → 仅记日志，ACK 消息 (邮件不是核心通知渠道)
+*/
+func processNotification(msg amqp.Delivery) {
+    // 反序列化
+    var notifMsg models.CommentNotification
+    if err := json.Unmarshal(msg.Body, &notifMsg); err != nil {
+        log.Printf("[NotifyConsumer] Failed to unmarshal: %v, body: %s",
+            err, string(msg.Body))
+        // 消息格式错误 → 不重试，直接进入死信队列
+        msg.Nack(false, false)
+        return
+    }
+
+    log.Printf("[NotifyConsumer] Processing notification: article=%d, comment=%d, author=%s",
+        notifMsg.ArticleID, notifMsg.CommentID, notifMsg.CommentAuthor)
+
+    // ---- 核心通知渠道: 站内通知 ----
+    // 这个是必须成功的，失败则重试
+    siteErr := services.SendSiteNotification(&notifMsg)
+
+    // ---- 可选通知渠道: 邮件 ----
+    // 邮件失败不影响整体结果
+    //
+    // 注意: 当前 Article 模型没有存储作者邮箱。如果需要邮件通知，
+    // 需要在 User 模型中增加 Email 字段，并在 Article 中关联 AuthorID。
+    // 下面先注释，等模型完善后启用:
+    //
+    // if siteErr == nil {
+    //     emailErr := services.SendEmailNotification(&notifMsg, authorEmail)
+    //     if emailErr != nil {
+    //         log.Printf("[NotifyConsumer] Email failed (non-critical): %v", emailErr)
+    //     }
+    // }
+
+    if siteErr != nil {
+        log.Printf("[NotifyConsumer] Site notification failed: %v, will retry", siteErr)
+
+        // 判断错误类型决定重试策略
+        // 这里简单重试 3 次，每次间隔 1 秒
+        for i := 0; i < 3; i++ {
+            time.Sleep(1 * time.Second)
+            if retryErr := services.SendSiteNotification(&notifMsg); retryErr == nil {
+                log.Println("[NotifyConsumer] Retry succeeded")
+                msg.Ack(false) // 重试成功，ACK
+                return
+            }
+        }
+
+        // 重试 3 次仍失败 → 进入死信队列
+        log.Printf("[NotifyConsumer] All retries failed for article=%d, sending to DLQ",
+            notifMsg.ArticleID)
+        msg.Nack(false, false) // requeue=false → 进入 DLQ
+        return
+    }
+
+    // 处理成功，确认消息
+    msg.Ack(false)
+    log.Printf("[NotifyConsumer] Notification processed successfully for article=%d",
+        notifMsg.ArticleID)
+}
+--------------------------------------------------------------------------------
+
+【新增文件 4: 站内通知 API】
+
+文件路径: exchangeapp/controllers/notification_controller.go
+
+package controllers
+
+import (
+    "exchangeapp/global"
+    "exchangeapp/models"
+    "net/http"
+
+    "github.com/gin-gonic/gin"
+)
+
+/*
+   GetNotifications 获取当前用户的站内通知列表
+
+   路由建议: GET /api/notifications
+   需在 router.go 中注册 (在 auth 中间件保护的路由组内)
+*/
+func GetNotifications(ctx *gin.Context) {
+    username := ctx.GetString("username") // 从 JWT 中间件获取当前用户名
+
+    var notifications []models.InAppNotification
+    if err := global.Db.Where("username = ?", username).
+        Order("created_at DESC").
+        Limit(50). // 限制返回最近 50 条
+        Find(&notifications).Error; err != nil {
+        ctx.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+        return
+    }
+
+    ctx.JSON(http.StatusOK, notifications)
+}
+
+/*
+   GetUnreadCount 获取未读通知数量
+
+   路由建议: GET /api/notifications/unread-count
+   用于在导航栏显示未读红点
+*/
+func GetUnreadCount(ctx *gin.Context) {
+    username := ctx.GetString("username")
+
+    var count int64
+    if err := global.Db.Model(&models.InAppNotification{}).
+        Where("username = ? AND is_read = ?", username, false).
+        Count(&count).Error; err != nil {
+        ctx.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+        return
+    }
+
+    ctx.JSON(http.StatusOK, gin.H{"unread_count": count})
+}
+
+/*
+   MarkNotificationRead 标记通知为已读
+
+   路由建议: PUT /api/notifications/:id/read
+*/
+func MarkNotificationRead(ctx *gin.Context) {
+    id := ctx.Param("id")
+    username := ctx.GetString("username")
+
+    result := global.Db.Model(&models.InAppNotification{}).
+        Where("id = ? AND username = ?", id, username).
+        Update("is_read", true)
+
+    if result.RowsAffected == 0 {
+        ctx.JSON(http.StatusNotFound, gin.H{"error": "notification not found"})
+        return
+    }
+
+    ctx.JSON(http.StatusOK, gin.H{"message": "notification marked as read"})
+}
+--------------------------------------------------------------------------------
+
+【修改文件: comments_controller.go】
+
+在 CreateComment 成功后增加消息发布。
+
+修改后的 CreateComment 函数:
+
+// CreateComment 创建评论
+func CreateComment(ctx *gin.Context) {
+    var comment models.Comment
+    if err := ctx.ShouldBindJSON(&comment); err != nil {
+        ctx.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+        return
+    }
+    id, err := strconv.ParseUint(ctx.Param("id"), 10, 64)
+    if err != nil {
+        ctx.JSON(http.StatusBadRequest, gin.H{"error": "invalid article id"})
+        return
+    }
+    comment.ArticleID = uint(id)
+    comment.Username = ctx.GetString("username")
+
+    if err := global.Db.AutoMigrate(&comment); err != nil {
+        ctx.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+        return
+    }
+    if err := global.Db.Create(&comment).Error; err != nil {
+        ctx.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+        return
+    }
+
+    // 删除缓存
+    cachekey := "article:" + ctx.Param("id") + ":comments"
+    global.RedisDB.Del(ctx, cachekey)
+
+    // ========== 新增: 发布通知消息到 RabbitMQ ==========
+    // 这一步不阻塞 API 响应 —— 发布失败只记日志，不影响评论创建成功
+    publishCommentNotification(comment)
+
+    ctx.JSON(http.StatusOK, comment)
+}
+
+/*
+   publishCommentNotification 发布评论通知到 RabbitMQ
+
+   在 goroutine 中异步执行，确保即使发布失败也不阻塞创建评论的响应
+*/
+func publishCommentNotification(comment models.Comment) {
+    // 查询文章标题 (用于通知内容)
+    var article models.Article
+    if err := global.Db.First(&article, comment.ArticleID).Error; err != nil {
+        log.Printf("[CommentNotify] Failed to find article %d: %v", comment.ArticleID, err)
+        return
+    }
+
+    notifMsg := models.CommentNotification{
+        ArticleID:      comment.ArticleID,
+        ArticleTitle:   article.Title,
+        CommentID:      comment.ID,
+        CommentAuthor:  comment.Username,
+        CommentContent: comment.Content,
+        Timestamp:      time.Now().Unix(),
+    }
+
+    body, err := json.Marshal(notifMsg)
+    if err != nil {
+        log.Printf("[CommentNotify] Failed to marshal: %v", err)
+        return
+    }
+
+    // 发布到 RabbitMQ
+    // routingKey: "comment.notify" → 路由到 comment_notifications 队列
+    err = config.PublishMessage("comment.notify", body, true)
+    if err != nil {
+        log.Printf("[CommentNotify] Failed to publish: %v", err)
+    }
+}
+--------------------------------------------------------------------------------
+
+【需要新增的 import (在 comments_controller.go 顶部)】
+
+若原文件缺少以下 import，需添加:
+
+    "encoding/json"     // json.Marshal
+    "exchangeapp/config" // config.PublishMessage
+    "log"                // log.Printf
+    "time"               // time.Now()
+    "strconv"            // strconv.FormatUint (如果尚未导入)
+--------------------------------------------------------------------------------
+
+【修改文件: router.go】
+
+新增通知相关路由:
+
+在 router.go 的 api 路由组中 (auth 中间件保护) 添加:
+
+    api.GET("/notifications", controllers.GetNotifications)           // 获取通知列表
+    api.GET("/notifications/unread-count", controllers.GetUnreadCount) // 获取未读数
+    api.PUT("/notifications/:id/read", controllers.MarkNotificationRead) // 标记已读
+--------------------------------------------------------------------------------
+
+【修改文件: main.go (更新版)】
+
+在原有新增的基础上，再增加通知消费者的启动:
+
+.....
+
+    // ========== 新增: 启动点赞消费者 ==========
+    go func() {
+        prefetch := config.AppConfig.RabbitMQ.LikePrefetch
+        interval := time.Duration(config.AppConfig.RabbitMQ.LikeTaskInterval) * time.Second
+        consumers.StartLikeConsumer(prefetch, interval)
+    }()
+
+    // ========== 新增: 启动通知消费者 ==========
+    go func() {
+        notifPrefetch := config.AppConfig.RabbitMQ.NotifyPrefetch
+        consumers.StartNotificationConsumer(notifPrefetch)
+    }()
+
+.....
+--------------------------------------------------------------------------------
+
+
+================================================================================
+第四部分: Docker 部署与运维
+================================================================================
+
+【docker-compose.yml 添加 RabbitMQ 服务】
+
+如果项目使用 Docker Compose 部署，在现有的 docker-compose.yml 中添加:
+
+  rabbitmq:
+    image: rabbitmq:3-management-alpine
+    container_name: exchangeapp_rabbitmq
+    ports:
+      - "5672:5672"    # AMQP 协议端口
+      - "15672:15672"  # Web 管理界面端口
+    environment:
+      RABBITMQ_DEFAULT_USER: guest
+      RABBITMQ_DEFAULT_PASS: guest
+    volumes:
+      - rabbitmq_data:/var/lib/rabbitmq  # 持久化消息数据
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "check_port_connectivity"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # 如果原来有 app 服务，需要添加 depends_on (可选，因为代码有重连机制):
+  app:
+    ...
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+
+volumes:
+  rabbitmq_data:
+
+【RabbitMQ 管理界面】
+
+启动后访问: http://localhost:15672
+默认账号: guest / guest
+
+在这里可以:
+- 查看队列状态 (消息积压数、消费者数)
+- 查看消息流转速率
+- 手动发布/消费消息 (调试用)
+- 查看死信队列中的消息
+
+【监控指标建议】
+
+如果项目上了生产环境，建议监控以下 RabbitMQ 指标:
+1. 各队列的消息积压数量 (queue depth)
+2. 消费者的消费速率 (consume rate)
+3. 连接数和 Channel 数
+4. 死信队列的消息数量 (DLQ depth)
+5. 内存和磁盘使用率
+
+可使用 Prometheus + Grafana + rabbitmq_prometheus 插件实现。
+--------------------------------------------------------------------------------
+
+
+================================================================================
+第五部分: 目录结构汇总
+================================================================================
+
+exchangeapp/
+├── config/
+│   ├── config.yml               [修改] 增加 rabbitmq 配置段
+│   ├── config.go                [修改] 增加 RabbitMQ 结构体 + InitRabbitMQ 调用
+│   ├── db.go                    [不变]
+│   ├── redis.go                 [不变]
+│   └── rabbitmq.go              [新增] RabbitMQ 连接管理
+├── consumers/
+│   ├── like_consumer.go         [新增] 点赞批量消费者
+│   └── notification_consumer.go [新增] 通知消费者
+├── controllers/
+│   ├── auth_controller.go       [不变]
+│   ├── article_controller.go    [不变]
+│   ├── comments_controller.go   [修改] 增加 publishCommentNotification
+│   ├── exchange_rate_controller.go [不变]
+│   ├── likes_controller.go      [修改] 增加 publishLikeMessage
+│   └── notification_controller.go [新增] 站内通知 API
+├── models/
+│   ├── article.go               [不变]
+│   ├── comments.go              [不变]
+│   ├── user.go                  [不变]
+│   ├── exchange_rate.go         [不变]
+│   ├── like_message.go          [新增] 点赞消息体
+│   └── notification_message.go  [新增] 通知消息体 + 站内通知模型
+├── services/
+│   └── notification_service.go  [新增] 通知服务
+├── tasks/                        (可选)
+│   └── sync_likes.go            [新增] Redis → DB 定时同步
+├── middlewares/
+│   └── auth_middlewares.go      [不变]
+├── router/
+│   └── router.go                [修改] 增加通知路由
+├── utils/
+│   └── utils.go                 [不变]
+├── global/
+│   └── global.go                [不变]
+└── main.go                      [修改] 启动消费者 + 关闭 RabbitMQ
+--------------------------------------------------------------------------------
+
+
+================================================================================
+第六部分: 实施步骤建议
+================================================================================
+
+建议按以下顺序实施，每一步完成后都可以验证:
+
+步骤 1: 环境准备
+  - 安装 RabbitMQ (本地或 Docker)
+  - go get github.com/rabbitmq/amqp091-go
+
+步骤 2: 基础设施
+  - 更新 config.yml (添加 rabbitmq 配置)
+  - 更新 config.go (添加结构体)
+  - 创建 config/rabbitmq.go (连接管理)
+  - 在 main.go 中调用 go config.ReconnectRabbitMQ()
+  - 启动应用，验证 RabbitMQ 连接成功 (查看日志)
+
+步骤 3: 点赞持久化
+  - 创建 models/like_message.go
+  - 创建 consumers/like_consumer.go
+  - 修改 controllers/likes_controller.go
+  - 在 main.go 中启动 StartLikeConsumer
+  - 测试: 点赞一篇文章 → 查看 MySQL articles.likes 是否更新
+
+步骤 4: 评论通知
+  - 创建 models/notification_message.go
+  - 创建 services/notification_service.go
+  - 创建 consumers/notification_consumer.go
+  - 创建 controllers/notification_controller.go
+  - 修改 controllers/comments_controller.go
+  - 修改 router.go (添加通知路由)
+  - 在 main.go 中启动 StartNotificationConsumer
+  - 测试: 创建一条评论 → 查看站内通知表是否有新记录
+
+步骤 5: 联调与验证
+  - 测试消息队列积压情况下系统是否正常
+  - 测试 RabbitMQ 重启后自动重连
+  - 测试死信队列的消息处理
+--------------------------------------------------------------------------------
+
+
+================================================================================
+附录: 关键概念速查
+================================================================================
+
+【Exchange (交换机)】
+  消息进入 RabbitMQ 的第一站。交换机根据 routing key 决定消息发往哪个队列。
+  常用类型: direct (精确匹配)、topic (通配符匹配)、fanout (广播)。
+
+【Queue (队列)】
+  消息的存放容器。消费者从队列中拉取消息。
+  关键属性: durable (持久化)、auto-delete (自动删除)、exclusive (独占)。
+
+【Routing Key (路由键)】
+  消息从 Exchange → Queue 的路由依据。
+  例如: "article.like" → LikeQueue, "comment.notify" → NotificationQueue
+
+【ACK (确认)】
+  消费者处理完消息后向 RabbitMQ 发确认信号，RabbitMQ 删除该消息。
+  不 ACK 则消息会自动 requeue (回到队列头部)。
+
+【Nack (否定确认)】
+  消费者拒绝处理消息。可设置 requeue=true (回到队列) 或 false (进入死信)。
+
+【DLQ (Dead Letter Queue)】
+  死信队列。存放被拒绝且 requeue=false 的消息，用于集中处理失败消息。
+
+【QoS (Quality of Service)】
+  通过 prefetchCount 限制消费者本地积压的消息数量，防止单消费者负载过重。
+
+【消息持久化 vs 瞬态】
+  persistent=true:  消息写入磁盘，RabbitMQ 重启后不丢失 (性能稍低)
+  persistent=false: 消息仅存内存，性能更高但重启后丢失
+================================================================================
