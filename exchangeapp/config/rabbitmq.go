@@ -18,7 +18,7 @@ const (
 
 // 交换机名称常量
 const (
-	DefaultExchange = "exchangeappexchange" //默认交换机
+	DefaultExchange = "exchangeappexchange" //默认交换机)(名称)
 )
 
 var (
@@ -36,6 +36,10 @@ func InitRabbitMQ() {
 	rabbitConn, err := amqp.Dial(dsn)
 	if err != nil {
 		log.Fatalf("Failed to connect to RabbitMQ:%v", err)
+	}
+	rabbituChan, err = rabbitConn.Channel()
+	if err != nil {
+		log.Fatalf("Failed to open a channel:%v", err)
 	}
 
 	declareExchange(rabbituChan)

@@ -11,7 +11,7 @@ rabbitmq:
   user: "guest"
   password: "guest"
   vhost: "/"
-  likeprefetch: 50
+  likeprefetch: 50 
   notifyprefetch: 10
   liketaskinterval: 5   # 点赞批量写入间隔 (秒)
 
