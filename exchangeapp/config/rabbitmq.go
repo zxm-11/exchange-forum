@@ -213,3 +213,9 @@ func PublishMessage(routingkey string, body []byte, persistent bool) error {
 		},
 	)
 }
+
+func GetRabbitMQConn() *amqp.Connection {
+	rabbitMu.Lock()
+	defer rabbitMu.Unlock()
+	return rabbitConn
+}
