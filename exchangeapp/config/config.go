@@ -16,6 +16,16 @@ type config struct {
 		MaxIdleConns int
 		MaxOpenConns int
 	}
+	RabbitMQ struct {
+		Host             string
+		Port             string
+		User             string
+		Password         string
+		Vhost            string
+		Likeprefetch     int
+		Notifyprefetch   int
+		Liketaskinterval int
+	}
 }
 
 var AppConfig *config
@@ -38,6 +48,7 @@ func InitConfig() {
 		log.Fatalf("Unable to decode into struct%v", err)
 	}
 
-	InitDB()    //初始化数据库连接
-	InitRedis() //初始化Redis连接
+	InitDB()       //初始化数据库连接
+	InitRedis()    //初始化Redis连接
+	InitRabbitMQ() //初始化RabbitMQ连接
 }

@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"exchangeapp/config"
+	"exchangeapp/consumers"
 	"exchangeapp/router"
 	"log"
 	"net/http"
@@ -15,6 +16,14 @@ func main() {
 
 	config.InitConfig()
 	r := router.SetupRouter()
+
+	go config.ReconnectRabbitMQ() //启动重连RabbitMQ的goroutine
+
+	go func() {
+		prefetch := config.AppConfig.RabbitMQ.Likeprefetch
+		interval := time.Duration(config.AppConfig.RabbitMQ.Liketaskinterval) * time.Second
+		consumers.LikeConsumer(prefetch, interval)
+	}()
 
 	port := config.AppConfig.App.Port
 
@@ -40,5 +49,7 @@ func main() {
 	if err := srv.Shutdown(ctx); err != nil { //关闭HTTP服务器,等待所有当前处理的请求完成
 		log.Println("Server Shutdown:", err)
 	}
+
+	config.CloseRabbitMQ()
 	log.Println("Server exiting")
 }

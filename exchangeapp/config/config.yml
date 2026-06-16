@@ -5,4 +5,14 @@ database:
   Dsn: "root:126070mxZ@tcp(127.0.0.1:3306)/text?charset=utf8mb4&parseTime=True&loc=Local"
   MaxIdleConns: 11
   MaxOpenConns: 114
-  
+rabbitmq:
+  host: "localhost"
+  port: "5672"
+  user: "guest"
+  password: "guest"
+  vhost: "/"
+  likeprefetch: 50 
+  notifyprefetch: 10
+  liketaskinterval: 5   # 点赞批量写入间隔 (秒)
+
+
