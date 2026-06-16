@@ -3,6 +3,7 @@ package consumers
 import (
 	"encoding/json"
 	"exchangeapp/config"
+	"exchangeapp/global"
 	"exchangeapp/models"
 	"log"
 	"time"
@@ -10,6 +11,7 @@ import (
 
 type likesBuffer map[uint]int
 
+// 启动点赞消费者
 func LikeConsumer(prefetch int, flushInterval time.Duration) {
 	log.Printf("[LikeConsumer] Starting with prefetch=%d,flushInterval=%v", prefetch, flushInterval) //prefetch:每次从队列中获取的消息数量,flushInterval:刷新时间间隔
 
@@ -80,12 +82,33 @@ func LikeConsumer(prefetch int, flushInterval time.Duration) {
 			//定时器触发，刷新数据库
 			if len(buffer) > 0 {
 				log.Printf("[LikeConsumer] Timer triggered,flushing%d articles...", len(buffer))
-				flushToDatabase(buffer)    //清空缓冲区
+				flushToDatabase(buffer)
 				buffer = make(likesBuffer) //重新初始化缓冲区
 			}
 		}
 	}
+ 
+}
+
+// 将聚合的点赞增量批量写入 MySQL数据库
+func flushToDatabase(buffer likesBuffer) {
+	for articleID, delta := range buffer {
+		result := global.Db.Model(&models.Article{}).Where("id=?", articleID).UpdateColumn("likes", global.Db.Raw("likes+?", delta))
+
+		if result.Error != nil {
+			log.Printf("[LikeConsumer] failed to update likes for articleID:%d,err:%v", articleID, result.Error)
+			continue
+		}
+		if result.RowsAffected == 0 { //改变行量
+			log.Printf("[LikeConsumer] Article%d not found,skipping like delta%d", articleID, delta)
+			continue
+		}
+
+		log.Printf("[LikeConsumer] Updated likes for articleID:%d, delta:%d", articleID, delta)
+	}
 
 }
 
-func flushToDatabase(buffer likesBuffer) {}
+
+
+

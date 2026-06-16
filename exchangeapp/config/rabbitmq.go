@@ -29,7 +29,7 @@ var (
 )
 
 func InitRabbitMQ() {
-	cfg := AppConfig.rabbitMQ
+	cfg := AppConfig.RabbitMQ
 	dsn := fmt.Sprintf("amqp://%s:%s@%s:%s%s", cfg.User, cfg.Password, cfg.Host, cfg.Port, cfg.Vhost)
 
 	var err error
@@ -142,7 +142,7 @@ func ReconnectRabbitMQ() {
 		for {
 			time.Sleep(3 * time.Second)
 			log.Println("Attempting to reconnect to RabbitMQ...")
-			cfg := AppConfig.rabbitMQ
+			cfg := AppConfig.RabbitMQ
 			dsn := fmt.Sprintf("amqp://%s:%s@%s:%s%s", cfg.User, cfg.Password, cfg.Host, cfg.Port, cfg.Vhost)
 			conn, DialErr := amqp.Dial(dsn)
 			if DialErr != nil {

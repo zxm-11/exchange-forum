@@ -1,8 +1,14 @@
 package controllers
 
 import (
+	"encoding/json"
+	"exchangeapp/config"
 	"exchangeapp/global"
+	"exchangeapp/models"
+	"log"
 	"net/http"
+	"strconv"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/go-redis/redis/v8"
@@ -20,9 +26,33 @@ func LikeArticles(ctx *gin.Context) {
 		return
 	}
 
+	// 发送点赞消息到RabbitMQ
+	publishLikeMessage(articleId)
+
 	ctx.JSON(http.StatusOK, gin.H{
 		"message": "Successfully liked the article",
 	})
+}
+
+func publishLikeMessage(articleId string) {
+	id, err := strconv.ParseUint(articleId, 10, 64)
+	if err != nil {
+		log.Printf("[LikeMessagge] Invalid articleID:%s,err:%v", articleId, err)
+		return
+	}
+	LikeMsg := models.LikeMessage{
+		ArticleID: uint(id),
+		Timestamp: time.Now().Unix(),
+	}
+	body, err := json.Marshal(LikeMsg)
+	if err != nil {
+		log.Printf("[LikeMessage] Failed to marshal:%v", err)
+		return
+	}
+	err = config.PublishMessage("article.like", body, true)
+	if err != nil {
+		log.Printf("[LikeMessage] Failed to publish:%v", err)
+	}
 }
 
 // 获取文章点赞数
@@ -44,4 +74,5 @@ func GetArticleLikes(ctx *gin.Context) {
 	ctx.JSON(http.StatusOK, gin.H{
 		"likes": likes,
 	})
+
 }
