@@ -22,6 +22,7 @@ func CreateAritcle(ctx *gin.Context) {
 		ctx.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
+	article.Username = ctx.GetString("username")
 
 	//自动迁移数据库表 (确保数据库中有这张表，并且表的结构跟 article 结构体一致,则更新,如果表不存在,则创建)	(DDL)
 	if err := global.Db.AutoMigrate(&article); err != nil {

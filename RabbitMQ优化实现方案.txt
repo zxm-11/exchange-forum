@@ -1761,3 +1761,75 @@ exchangeapp/
   persistent=true:  消息写入磁盘，RabbitMQ 重启后不丢失 (性能稍低)
   persistent=false: 消息仅存内存，性能更高但重启后丢失
 ================================================================================
+
+
+================================================================================
+补充说明: AutoMigrate 集中管理
+================================================================================
+
+【问题】
+
+项目现有代码中，多个 Controller 在每次请求时都调用 AutoMigrate:
+
+    func CreateAritcle(ctx *gin.Context) {
+        global.Db.AutoMigrate(&article)   // ← 每条请求跑一次 DDL
+        ...
+    }
+
+    func CreateComment(ctx *gin.Context) {
+        global.Db.AutoMigrate(&comment)   // ← 同上
+        ...
+    }
+
+每次请求都检查表结构是性能浪费，且新增的 InAppNotification 表如果也
+按这种模式，需要在使用处重复调用。
+
+【解决方案: 启动时一次性迁移】
+
+修改 exchangeapp/config/db.go，在 InitDB 末尾集中执行所有模型的 AutoMigrate:
+
+    func InitDB() {
+        dsn := AppConfig.Database.Dsn
+        db, err := gorm.Open(mysql.Open(dsn), &gorm.Config{})
+        if err != nil {
+            log.Fatalf("Failed to initialize database,got error %v", err)
+        }
+        sqlDB, err := db.DB()
+        sqlDB.SetMaxIdleConns(AppConfig.Database.MaxIdleConns)
+        sqlDB.SetMaxOpenConns(AppConfig.Database.MaxOpenConns)
+        sqlDB.SetConnMaxLifetime(time.Hour)
+
+        if err != nil {
+            log.Fatalf("Failed to configure database,got error %v", err)
+        }
+
+        // ========== 新增: 集中自动迁移所有模型 ==========
+        db.AutoMigrate(
+            &models.Article{},
+            &models.User{},
+            &models.Comment{},
+            &models.InAppNotification{},  // 站内通知表
+        )
+        // =============================================
+
+        global.Db = db
+    }
+
+[b] 效果:[/b]
+- 启动应用时一次性建好所有表，后续请求不再执行 DDL
+- 新增模型只需在 InitDB 里加一行，不用在使用处各自调用
+- 通知服务 (SendSiteNotification) 无需额外 AutoMigrate
+
+[b] 需要新增的 import (db.go):[/b]
+
+    "exchangeapp/models"
+
+[b] 配套清理 (可选):[/b]
+
+之后可以删除各 Controller 中的 AutoMigrate 调用，保留不影响功能，
+但移除更干净:
+
+- article_controller.go 第 27 行: 删除 global.Db.AutoMigrate(&article)
+- comments_controller.go 第 32 行: 删除 global.Db.AutoMigrate(&comment)
+- auth_controller.go 第 40 行:   删除 global.Db.AutoMigrate(&user)
+================================================================================
