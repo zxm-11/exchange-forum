@@ -2,8 +2,10 @@ package controllers
 
 import (
 	"encoding/json"
+	"exchangeapp/config"
 	"exchangeapp/global"
 	"exchangeapp/models"
+	"log"
 	"net/http"
 	"strconv"
 	"time"
@@ -43,7 +45,40 @@ func CreateComment(ctx *gin.Context) {
 	}
 	cachekey := "article:" + ctx.Param("id") + ":comments" //定义一个缓存key,用于存储文章详情的缓存key
 	global.RedisDB.Del(ctx, cachekey)                      //删除文章详情的缓存,让下一次访问文章详情时重新查询数据库并更新缓存
+
+	//发布消息给RabbitMQ,通知其他服务有新的评论创建
+	publishCommentNotification(comment)
+
 	ctx.JSON(http.StatusOK, comment)
+}
+
+func publishCommentNotification(comment models.Comment) {
+	var article models.Article
+	if err := global.Db.First(&article, comment.ArticleID).Error; err != nil {
+		log.Printf("[CommentNotify] Failed to find ArticleID:%d:%v", comment.ArticleID, err)
+		return
+	}
+
+	notifMsg := models.CommentNotification{
+		ArticleID:      comment.ArticleID,
+		ArticleTitle:   article.Title,
+		CommentID:      comment.ID,
+		CommentAuthor:  comment.Username,
+		CommentContent: comment.Content,
+		Timestamp:      time.Now().Unix(),
+	}
+	body, err := json.Marshal(notifMsg)
+	if err != nil {
+		log.Printf("[CommentNotify] Failed to marshal CommentNotification:%v", err)
+		return
+	}
+
+	// 发布消息给RabbitMQ,通知其他服务有新的评论创建
+	err = config.PublishMessage("comment_notification", body, false)
+	if err != nil {
+		log.Printf("[CommentNotify] Failed to publish CommentNotification:%v", err)
+		return
+	}
 }
 
 // GetCommentsByArticleID函数用于获取文章下的评论列表
