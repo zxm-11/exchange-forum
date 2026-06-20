@@ -17,11 +17,13 @@ func StartNotificationConsumer(prefetch int) {
 
 	conn := config.GetRabbitMQConn()
 	if conn == nil {
-		log.Fatalf("[NotifyConsumer] RabbitMQ connectiion is nil")
+		log.Printf("[NotifyConsumer] RabbitMQ connectiion is nil")
+		return
 	}
 	ch, err := conn.Channel()
 	if err != nil {
-		log.Fatalf("[NotifyConsumer] Faile to create channel:%v", err)
+		log.Printf("[NotifyConsumer] Faile to create channel:%v", err)
+		return
 	}
 	defer ch.Close()
 
@@ -31,7 +33,8 @@ func StartNotificationConsumer(prefetch int) {
 		false,
 	)
 	if err != nil {
-		log.Fatalf("[NotifyConsumer] Failed to set Qos:%v", err)
+		log.Printf("[NotifyConsumer] Failed to set Qos:%v", err)
+		return
 	}
 
 	msgs, err := ch.Consume(
@@ -44,7 +47,8 @@ func StartNotificationConsumer(prefetch int) {
 		nil,
 	)
 	if err != nil {
-		log.Fatalf("[NotifyConsumer] Failed to start consumer:%v", err)
+		log.Printf("[NotifyConsumer] Failed to start consumer:%v", err)
+		return
 	}
 
 	for msg := range msgs {

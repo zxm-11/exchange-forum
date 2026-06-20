@@ -74,7 +74,7 @@ func publishCommentNotification(comment models.Comment) {
 	}
 
 	// 发布消息给RabbitMQ,通知其他服务有新的评论创建
-	err = config.PublishMessage("comment_notification", body, false)
+	err = config.PublishMessage("comment.notify", body, true)
 	if err != nil {
 		log.Printf("[CommentNotify] Failed to publish CommentNotification:%v", err)
 		return

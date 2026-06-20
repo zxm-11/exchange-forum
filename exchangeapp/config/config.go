@@ -22,9 +22,9 @@ type config struct {
 		User             string
 		Password         string
 		Vhost            string
-		Likeprefetch     int
-		Notifyprefetch   int
-		Liketaskinterval int
+		Likeprefetch     int //点赞消费者预取数量
+		Notifyprefetch   int //通知消费者预取数量
+		Liketaskinterval int //点赞任务任务间隔
 	}
 }
 

@@ -24,7 +24,7 @@ const (
 var (
 	rabbitConn   *amqp.Connection
 	rabbituChan  *amqp.Channel
-	rabbitMu     sync.Mutex
+	rabbitMu     sync.RWMutex
 	rabbitNotify chan *amqp.Error //Connection 异常通知 channel
 )
 
@@ -33,13 +33,15 @@ func InitRabbitMQ() {
 	dsn := fmt.Sprintf("amqp://%s:%s@%s:%s%s", cfg.User, cfg.Password, cfg.Host, cfg.Port, cfg.Vhost)
 
 	var err error
-	rabbitConn, err := amqp.Dial(dsn)
+	rabbitConn, err = amqp.Dial(dsn)
 	if err != nil {
-		log.Fatalf("Failed to connect to RabbitMQ:%v", err)
+		log.Printf("Failed to connect to RabbitMQ:%v", err)
+		return
 	}
 	rabbituChan, err = rabbitConn.Channel()
 	if err != nil {
-		log.Fatalf("Failed to open a channel:%v", err)
+		log.Printf("Failed to open a channel:%v", err)
+		return
 	}
 
 	declareExchange(rabbituChan)
@@ -93,13 +95,13 @@ func declareQueue(ch *amqp.Channel) {
 		false,
 		amqp.Table{
 			"x-dead-letter-exchange":    DefaultExchange, //死信回到defaultexchange交换机
-			"x-dead-letter-routing-key": DeadLetterqueue, //死信路由键
+			"x-dead-letter-routing-key": "dead.letter",   //死信路由键
 		},
 	)
 	if err != nil {
 		log.Fatalf("Failed to declare queue:%v", err)
 	}
-	ch.QueueBind(Likequeue, "artilce.like", DefaultExchange, false, nil)
+	ch.QueueBind(Likequeue, "article.like", DefaultExchange, false, nil)
 
 	//3.评论通知队列
 	_, err = ch.QueueDeclare(
@@ -110,7 +112,7 @@ func declareQueue(ch *amqp.Channel) {
 		false,
 		amqp.Table{
 			"x-dead-letter-exchange":    DefaultExchange,
-			"x-dead-letter-routing-key": DeadLetterqueue,
+			"x-dead-letter-routing-key": "dead.letter",   //死信路由键
 		},
 	)
 	if err != nil {
@@ -121,9 +123,9 @@ func declareQueue(ch *amqp.Channel) {
 
 // GetChannel 线程安全地获取 RabbitMQ Channel
 func GetChannel() (*amqp.Channel, func()) {
-	rabbitMu.Lock()
+	rabbitMu.RLock()
 	return rabbituChan, func() {
-		rabbitMu.Unlock()
+		rabbitMu.RUnlock()
 	}
 }
 
@@ -136,7 +138,7 @@ func ReconnectRabbitMQ() {
 			return
 		}
 
-		log.Fatalf("RabbitMQ connection closed:%v,attempting reconnect...", err)
+		log.Printf("RabbitMQ connection closed:%v,attempting reconnect...", err)
 
 		//无限重连直到连接成功
 		for {
@@ -146,12 +148,12 @@ func ReconnectRabbitMQ() {
 			dsn := fmt.Sprintf("amqp://%s:%s@%s:%s%s", cfg.User, cfg.Password, cfg.Host, cfg.Port, cfg.Vhost)
 			conn, DialErr := amqp.Dial(dsn)
 			if DialErr != nil {
-				log.Fatalf("Failed to reconnect to RabbitMQ:%v,Retrying...", DialErr)
+				log.Printf("Failed to reconnect to RabbitMQ:%v,Retrying...", DialErr)
 				continue
 			}
-			ch, chErr := rabbitConn.Channel()
+			ch, chErr := conn.Channel()
 			if chErr != nil {
-				log.Fatalf("Failed to create channel:%v,Retrying...", chErr)
+				log.Printf("Failed to create channel:%v,Retrying...", chErr)
 				continue
 			}
 			//原子更新全局连接
@@ -194,6 +196,9 @@ func CloseRabbitMQ() {
 // PubilshMesssage
 func PublishMessage(routingkey string, body []byte, persistent bool) error {
 	ch, release := GetChannel()
+	if ch == nil {
+		return fmt.Errorf("rabbitmq channel is nil")
+	}
 	defer release() //释放Channel
 
 	deliveryMode := amqp.Transient //非持久化消息(消息仅在内存中，性能更好但可能丢失)
@@ -215,7 +220,7 @@ func PublishMessage(routingkey string, body []byte, persistent bool) error {
 }
 
 func GetRabbitMQConn() *amqp.Connection {
-	rabbitMu.Lock()
-	defer rabbitMu.Unlock()
+	rabbitMu.RLock()
+	defer rabbitMu.RUnlock()
 	return rabbitConn
 }

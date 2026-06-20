@@ -19,10 +19,17 @@ func main() {
 
 	go config.ReconnectRabbitMQ() //启动重连RabbitMQ的goroutine
 
+	// 启动点赞消费者
 	go func() {
 		prefetch := config.AppConfig.RabbitMQ.Likeprefetch
 		interval := time.Duration(config.AppConfig.RabbitMQ.Liketaskinterval) * time.Second
 		consumers.LikeConsumer(prefetch, interval)
+	}()
+
+	// 启动通知消费者
+	go func() {
+		notifPrefetch := config.AppConfig.RabbitMQ.Notifyprefetch
+		consumers.StartNotificationConsumer(notifPrefetch)
 	}()
 
 	port := config.AppConfig.App.Port
