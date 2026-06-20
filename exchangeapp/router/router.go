@@ -14,7 +14,7 @@ func SetupRouter() *gin.Engine {
 	r := gin.Default()
 	r.Use(cors.New(cors.Config{
 		AllowOrigins:     []string{"http://localhost:5173"},
-		AllowMethods:     []string{"GET", "POST","DELETE"},
+		AllowMethods:     []string{"GET", "POST", "DELETE", "PUT"},
 		AllowHeaders:     []string{"Origin", "Content-Type", "Authorization"}, //允许的请求头,包括Authorization用于携带JWT token
 		ExposeHeaders:    []string{"Content-Length"},
 		AllowCredentials: true,
@@ -37,11 +37,14 @@ func SetupRouter() *gin.Engine {
 		api.GET("/articles", controllers.GetArticles)              //获取所有文章
 		api.GET("/articles/:id", controllers.GetArticleById)       //获取指定文章
 
-		api.POST("/articles/:id/like", controllers.LikeArticles)   //点赞文章
-		api.GET("/articles/:id/like", controllers.GetArticleLikes) //获取文章点赞数
-		api.POST("/articles/:id/comments",controllers.CreateComment) //创建评论
-		api.GET("/articles/:id/comments",controllers.GetCommentsByArticleID) //获取文章下的评论列表
-		api.DELETE("/articles/:id/comments/:comment_id",controllers.DeleteComment) //删除评论
+		api.POST("/articles/:id/like", controllers.LikeArticles)                    //点赞文章
+		api.GET("/articles/:id/like", controllers.GetArticleLikes)                  //获取文章点赞数
+		api.POST("/articles/:id/comments", controllers.CreateComment)               //创建评论
+		api.GET("/articles/:id/comments", controllers.GetCommentsByArticleID)       //获取文章下的评论列表
+		api.DELETE("/articles/:id/comments/:comment_id", controllers.DeleteComment) //删除评论
+		api.GET("/notifications", controllers.GetNotifications)                     //获取通知列表
+		api.GET("/notifications/unread_count", controllers.GetUnreadCount)          //获取未读通知数量
+		api.PUT("/notifications/:id/read", controllers.MarkNotificationRead)        //标记通知为已读
 	}
 	return r
 }

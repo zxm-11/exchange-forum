@@ -17,12 +17,14 @@ func LikeConsumer(prefetch int, flushInterval time.Duration) {
 
 	conn := config.GetRabbitMQConn()
 	if conn == nil {
-		log.Fatalf("[LikeConsumer] Connection is nil")
+		log.Printf("[LikeConsumer] Connection is nil")
+		return
 	}
 
 	ch, err := conn.Channel()
 	if err != nil {
-		log.Fatalf("[LikeConsumer] Failed to open a channel:%v", err)
+		log.Printf("[LikeConsumer] Failed to open a channel:%v", err)
+		return
 	}
 
 	defer ch.Close()
@@ -30,7 +32,8 @@ func LikeConsumer(prefetch int, flushInterval time.Duration) {
 	//配置Qos
 	err = ch.Qos(prefetch, 0, false)
 	if err != nil {
-		log.Fatalf("[LikeConsumer] Failed to set Qos:%v", err)
+		log.Printf("[LikeConsumer] Failed to set Qos:%v", err)
+		return
 	}
 
 	//消费
@@ -44,7 +47,8 @@ func LikeConsumer(prefetch int, flushInterval time.Duration) {
 		nil,
 	)
 	if err != nil {
-		log.Fatalf("[LikeConsumer] Failed to consume:%v", err)
+		log.Printf("[LikeConsumer] Failed to consume:%v", err)
+		return
 	}
 
 	//初始化聚合缓冲区

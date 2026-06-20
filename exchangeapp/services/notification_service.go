@@ -14,7 +14,7 @@ func SendSiteNotification(notif *models.CommentNotification) error {
 	}
 	notifRecord := models.InAppNotification{
 		Username: article.Username,
-		Title:    article.Title,
+		Title:    "新评论通知",
 		Content: fmt.Sprintf("用户%s评论了文章《%s》:%s",
 			notif.CommentAuthor,
 			notif.ArticleTitle,

@@ -23,6 +23,7 @@ RUN apk add --no-cache ca-certificates tzdata
 WORKDIR /app
 
 COPY --from=builder /build/server .
+COPY exchangeapp/config/config.yml ./config/config.yml
 
 ENV GIN_MODE=release \
     TZ=Asia/Shanghai
@@ -31,6 +32,6 @@ RUN adduser -D -H -h /app appuser && \
     chown -R appuser:appuser /app
 USER appuser
 
-EXPOSE 8080
+EXPOSE 3000
 
 CMD ["./server"]

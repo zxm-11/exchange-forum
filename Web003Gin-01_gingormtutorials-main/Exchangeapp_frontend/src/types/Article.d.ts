@@ -16,3 +16,13 @@ export interface Comment {
     username: string;
     content: string;
 }
+
+export interface Notification {
+    ID: number;
+    CreatedAt: string;
+    username: string;
+    title: string;
+    content: string;
+    link: string;
+    is_read: boolean;
+}

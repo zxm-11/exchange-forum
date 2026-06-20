@@ -6,6 +6,7 @@ import NewsDetailView from '../views/NewsDetailView.vue';
 import Login from '../components/Login.vue';
 import Register from '../components/Register.vue';
 import CreateArticleView from '../views/CreateArticleView.vue';
+import NotificationView from '../views/NotificationView.vue';
 
 const routes: RouteRecordRaw[] = [
   { path: '/', name: 'Home', component: HomeView },
@@ -13,6 +14,7 @@ const routes: RouteRecordRaw[] = [
   { path: '/news', name: 'News', component: NewsView },
   { path: '/news/:id', name: 'NewsDetail', component: NewsDetailView },
   { path: '/create-article', name: 'CreateArticle', component: CreateArticleView },
+  { path: '/notifications', name: 'Notifications', component: NotificationView },
   { path: '/login', name: 'Login', component: Login },
   { path: '/register', name: 'Register', component: Register },
 ];

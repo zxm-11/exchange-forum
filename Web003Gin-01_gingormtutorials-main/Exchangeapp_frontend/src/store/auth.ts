@@ -5,6 +5,7 @@ import axios from '../axios';
 export const useAuthStore = defineStore('auth', () => {
   const token = ref<string | null>(localStorage.getItem('token'));
   const username = ref<string | null>(localStorage.getItem('username'));
+  const unreadCount = ref(0);
 
   const isAuthenticated = computed(() => !!token.value);
 
@@ -47,16 +48,29 @@ export const useAuthStore = defineStore('auth', () => {
   const logout = () => {
     token.value = null;
     username.value = null;
+    unreadCount.value = 0;
     localStorage.removeItem('token');
     localStorage.removeItem('username');
+  };
+
+  const fetchUnreadCount = async () => {
+    if (!token.value) return;
+    try {
+      const res = await axios.get('/notifications/unread_count');
+      unreadCount.value = res.data.Unread_count || 0;
+    } catch {
+      // 静默失败
+    }
   };
 
   return {
     token,
     username,
+    unreadCount,
     isAuthenticated,
     login,
     register,
-    logout
+    logout,
+    fetchUnreadCount
   };
 });

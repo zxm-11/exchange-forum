@@ -9,7 +9,7 @@ import (
 )
 
 // Getnotifications 获取用户通知列表
-func Getnotifications(ctx *gin.Context) {
+func GetNotifications(ctx *gin.Context) {
 	username := ctx.GetString("username")
 	var notifications []models.InAppNotification
 
@@ -45,7 +45,7 @@ func GetUnreadCount(ctx *gin.Context) {
 func MarkNotificationRead(ctx *gin.Context) {
 	id := ctx.Param("id")
 	username := ctx.GetString("username")
-	result := global.Db.Model(&models.InAppNotification{}).Where("id=? AND username=?", id, username).Update("is_read=?", true)
+	result := global.Db.Model(&models.InAppNotification{}).Where("id=? AND username=?", id, username).Update("is_read", true)
 
 	if result.RowsAffected == 0 {
 		ctx.JSON(http.StatusNotFound, gin.H{
