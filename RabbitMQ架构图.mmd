@@ -1,0 +1,80 @@
+flowchart TB
+    %% ============ 前端 ============
+    subgraph FE["前端 Vue.js (:5173)"]
+        direction TB
+        FE_LIKE["用户点击「点赞」"]
+        FE_COMMENT["用户发表评论"]
+    end
+
+    %% ============ Gin 路由层 ============
+    subgraph ROUTER["Gin 路由层 router.go"]
+        direction TB
+        RT_LIKE["POST /api/articles/:id/like"]
+        RT_COMMENT["POST /api/articles/:id/comments"]
+    end
+
+    %% ============ 生产者(Controller) ============
+    subgraph PROD["生产者 · controllers/"]
+        direction TB
+        C_LIKE["LikeArticles()<br/>likes_controller.go"]
+        C_COMMENT["CreateComment()<br/>comments_controller.go"]
+    end
+
+    %% ============ Redis ============
+    subgraph REDIS["Redis 缓存"]
+        direction TB
+        RD_LIKE[("article:{id}:likes")]
+        RD_COMMENT[("article:{id}:comments 缓存")]
+    end
+
+    %% ============ RabbitMQ Broker ============
+    subgraph MQ["RabbitMQ Broker (:5672)"]
+        direction TB
+        EX(("exchangeappexchange<br/>topic · 持久化"))
+        Q_LIKE[("article_likes<br/>持久化队列")]
+        Q_NOTIFY[("comment_notifications<br/>持久化队列")]
+        Q_DLQ[("dead_letter<br/>死信队列 · 24h TTL")]
+    end
+
+    %% ============ 消费者 ============
+    subgraph CONS["消费者 · consumers/ (goroutine)"]
+        direction TB
+        CON_LIKE["LikeConsumer(prefetch=50)<br/>批量聚合 + 每5s刷库"]
+        CON_NOTIFY["NotificationConsumer(prefetch=10)<br/>逐条处理 · 重试3次"]
+    end
+
+    %% ============ 服务层 ============
+    subgraph SVC["服务层 · services/"]
+        direction TB
+        SVC_NOTIF["SendSiteNotification()"]
+    end
+
+    %% ============ 数据库 ============
+    subgraph DB["MySQL (GORM)"]
+        direction TB
+        T_ART[("articles · likes")]
+        T_NOTIF[("in_app_notifications")]
+    end
+
+    %% ============ 链路一: 点赞 ============
+    FE_LIKE --> RT_LIKE --> C_LIKE
+    C_LIKE -->|"① Redis INCR (同步)"| RD_LIKE
+    C_LIKE -->|"② Publish article.like (异步)"| EX
+    EX -->|"routing: article.like"| Q_LIKE
+    Q_LIKE -->|"Consume"| CON_LIKE
+    CON_LIKE -->|"UPDATE likes = likes + delta"| T_ART
+    T_ART -.->|"like"| RD_LIKE
+
+    %% ============ 链路二: 评论通知 ============
+    FE_COMMENT --> RT_COMMENT --> C_COMMENT
+    C_COMMENT -->|"① INSERT + DEL 缓存 (同步)"| RD_COMMENT
+    C_COMMENT -->|"② Publish comment.notify (异步)"| EX
+    EX -->|"routing: comment.notify"| Q_NOTIFY
+    Q_NOTIFY -->|"Consume"| CON_NOTIFY
+    CON_NOTIFY --> SVC_NOTIF
+    SVC_NOTIF -->|"INSERT 站内通知"| T_NOTIF
+
+    %% ============ 死信 & 失败处理 ============
+    Q_LIKE -.->|"解析失败 Nack → DLQ"| Q_DLQ
+    Q_NOTIFY -.->|"重试3次仍失败 Nack → DLQ"| Q_DLQ
+    Q_DLQ -.->|"24h TTL 过期"| X_DROP(("丢弃"))

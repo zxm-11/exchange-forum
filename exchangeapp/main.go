@@ -51,7 +51,7 @@ func main() {
 	signal.Notify(quit, os.Interrupt) //监听操作系统的中断信号,当用户按下Ctrl+C时会触发这个信号
 	<-quit                            //阻塞主线程,直到接收到中断信号
 	log.Println("Shutdown Server...")
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second) //设置一个超时上下文,等待当前处理的请求完成
 	defer cancel()
 	if err := srv.Shutdown(ctx); err != nil { //关闭HTTP服务器,等待所有当前处理的请求完成
 		log.Println("Server Shutdown:", err)

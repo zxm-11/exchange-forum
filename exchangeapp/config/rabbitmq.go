@@ -112,7 +112,7 @@ func declareQueue(ch *amqp.Channel) {
 		false,
 		amqp.Table{
 			"x-dead-letter-exchange":    DefaultExchange,
-			"x-dead-letter-routing-key": "dead.letter",   //死信路由键
+			"x-dead-letter-routing-key": "dead.letter", //死信路由键
 		},
 	)
 	if err != nil {
@@ -134,7 +134,7 @@ func ReconnectRabbitMQ() {
 	for {
 		err, ok := <-rabbitNotify
 		if !ok {
-			// 连接已关闭，退出循环
+			// channel已关闭(连接已关闭)，退出循环
 			return
 		}
 
@@ -190,7 +190,6 @@ func CloseRabbitMQ() {
 		rabbitConn.Close()
 	}
 	log.Println("RabbitMQ connection closed successfully")
-
 }
 
 // PubilshMesssage

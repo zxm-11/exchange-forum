@@ -30,7 +30,7 @@ func CreateComment(ctx *gin.Context) {
 		return
 	}
 	comment.ArticleID = uint(id)                 //将文章ID赋值给评论的ArticleID字段
-	comment.Username = ctx.GetString("username") //从上下文中获取用户名，并赋值给评论的Username字段
+	comment.Username = ctx.GetString("username") //从上下文 (中间件中SET的,本身获取的是接口类型,这里转化成了字符串) 中获取用户名，并赋值给评论的Username字段
 	if err := global.Db.AutoMigrate(&comment); err != nil {
 		ctx.JSON(http.StatusInternalServerError, gin.H{
 			"error": err.Error(),
@@ -89,7 +89,7 @@ func GetCommentsByArticleID(ctx *gin.Context) {
 	if err == redis.Nil {
 		var comments []models.Comment
 		if err := global.Db.Where("article_id=?", ctx.Param("id")).Order("created_at DESC").Find(&comments).Error; err != nil {
-			ctx.JSON(http.StatusInternalServerError, gin.H{
+			ctx.JSON(http.StatusInternalServerError, gin.H{ //降序排序是为了让最新的评论(晚存入的）在前面显示
 				"error": err.Error(),
 			})
 			return

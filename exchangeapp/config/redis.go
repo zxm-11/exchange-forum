@@ -8,7 +8,6 @@ import (
 	"github.com/go-redis/redis/v8"
 )
 
-// Redis连接配置
 func InitRedis() {
 
 	RedisClient := redis.NewClient(&redis.Options{
